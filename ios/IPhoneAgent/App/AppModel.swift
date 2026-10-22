@@ -71,6 +71,7 @@ import UIKit
     private var lastStatus = ""
     private var lastTick = now()
     private var lastStreamLog = 0.0
+    private var streamStarting = false
     private var timers: [Task<Void, Never>] = []
     var backgroundTask: UIBackgroundTaskIdentifier = .invalid
     var lastWidgetReload = 0.0
@@ -109,10 +110,12 @@ import UIKit
         board.onVideo = { [weak self] in self?.feed.receive($0) }
         board.onStatus = { [weak self] s in
             self?.statusRefreshError = nil
+            self?.pointer.useTransport(s.inputTransport)
             self?.feed.mirroring = s.ap == "streaming"
             if let up = s.up { self?.feed.boardClock(ms: up) }
             self?.metrics.status(s)
             self?.logStatus(s)
+            self?.keepStreamOn()
         }
         board.onLinkUp = { [weak self] in
             guard let self else { return }
@@ -184,6 +187,22 @@ import UIKit
         if feed.streamOn { _ = try? await feed.stream(false) }
     }
 
+    /// Mirroring over a live link: make sure the board streams (VideoFeed.keepStreaming). A failed attempt is
+    /// retried with the next status notify.
+    private func keepStreamOn() {
+        guard feed.mirroring, feed.keepStreaming, !feed.streamOn, board.connected, !streamStarting else { return }
+        streamStarting = true
+        Task { [weak self] in
+            defer { self?.streamStarting = false }
+            do {
+                try await self?.feed.stream(true)
+                DebugLog.write("stream: on while mirroring")
+            } catch {
+                DebugLog.write("stream: on while mirroring failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     func setFrameMode(_ mode: FrameMode) {
         FrameMode.current = mode
         say("frame mode: \(mode.rawValue)")
@@ -194,7 +213,7 @@ import UIKit
     /// The run paused for the board (line) or goes on (nil).
     /// Board status changes go to the debug log (not every identical notify).
     private func logStatus(_ s: BoardStatus) {
-        let line = "board status: ap \(s.ap ?? "-") usb \(s.usb ?? "-") sta \(s.sta.map(String.init) ?? "-")"
+        let line = "board status: ap \(s.ap ?? "-") hid \(s.inputTransport) ready \(s.inputReady) usb \(s.usb ?? "-") sta \(s.sta.map(String.init) ?? "-")"
             + " screen \(s.w.map(String.init) ?? "-")x\(s.h.map(String.init) ?? "-") rst \(s.rst ?? "-")"
         guard line != lastStatus else { return }
         lastStatus = line
@@ -319,7 +338,7 @@ import UIKit
             catch { failed += 1 }
             try? await Task.sleep(nanoseconds: 2_000_000_000)
         }
-        try? await feed.stream(false)
+        try? await feed.release()
         decodedBefore = metrics.decodeErrors - decodedBefore
         say("background test: LLM \(ok) ok / \(failed) failed, decode errors \(decodedBefore), "
             + "suspensions \(metrics.suspensions), background alive \(Int(metrics.backgroundAlive)) s")

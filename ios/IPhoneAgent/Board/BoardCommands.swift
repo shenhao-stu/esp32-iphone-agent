@@ -114,7 +114,7 @@ extension BoardTransport {
     }
 
     /// Called once when a command times out (e.g. video starving control traffic): the app turns the
-    /// stream off, then the command is retried once.
+    /// stream off. The command may already have executed, so it is never retried.
     var onTimeout: ((String) async -> Void)?
 
     /// Send one command; returns the text after "ok" (e.g. bench's ms). Throws DeviceError on err/timeout.
@@ -125,20 +125,20 @@ extension BoardTransport {
         } catch let e as BoardTimeout {
             guard command != "ping", !command.hasPrefix("stream"), let onTimeout else { throw e }
             await onTimeout(command)
-            DebugLog.write("cmd retry after timeout: \(command.prefix(40))")
-            return try await send(command, timeout: nil)
+            throw e
         }
     }
 
     /// A timeout is the board being slow (e.g. a snap while it also streams), not a lost link: it throws
     /// BoardTimeout and keeps the connection; only a real CoreBluetooth disconnect fails as link lost.
     @discardableResult
-    func send(_ command: String, timeout custom: Double?) async throws -> String {
+    func send(_ command: String, timeout custom: Double?, urgent: Bool = false) async throws -> String {
         guard connected, let transport else { throw DeviceError(message: "board not connected") }
         let timeout = custom ?? Self.timeout(command)
         let name = String(command.split(separator: " ").first ?? "")
-        await lock.lock()
-        defer { lock.unlock() }
+        if !urgent { await lock.lock() }
+        defer { if !urgent { lock.unlock() } }
+        try Task.checkCancellation()
         let started = now()
         let id = nextID
         nextID += 1
@@ -184,6 +184,10 @@ extension BoardTransport {
         guard reply.ok else { throw DeviceError(message: "err " + reply.text) }
         return reply.text
     }
+
+    /// Stop must reach the firmware while a long move still owns the command lock.
+    @discardableResult
+    func stop() async throws -> String { try await send("stop", timeout: 3, urgent: true) }
 
     /// Send a debug-log line to the Mac harness through the board (`log <text>`): fire-and-forget, at most
     /// 10 a second, truncated to one write, dropped when the link is busy.

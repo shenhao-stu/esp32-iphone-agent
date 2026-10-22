@@ -16,7 +16,7 @@ import Foundation
     static let maxMiss = 0.06               // bigger misses are still corrected, but not learned from
 
     struct Span: Codable, Equatable { var w: Int, h: Int }
-    private struct Saved: Codable { var w: Int, h: Int, seen: [String: [[Double]]]?, quality: Double?, aspect: Double? }
+    private struct Saved: Codable { var w: Int, h: Int, seen: [String: [[Double]]]?, quality: Double?, aspect: Double?, transport: String? }
 
     let device: HIDDevice
     weak var screen: ScreenSource?
@@ -24,6 +24,7 @@ import Foundation
     @Published private(set) var span: Span?  // mouse units needed to cross the full screen width / height
     private var pos: (Int, Int)?  // pointer position in mouse units; nil = unknown
     private var moves = 0
+    private var transport = "usb"
     private var link = 0  // device.links when the pointer was last homed
     /// where the pointer really landed (seen on screen) for the fraction we aimed at, per axis; a line fit
     /// through them corrects every later move, so taps get better as the agent works
@@ -42,6 +43,7 @@ import Foundation
         self.screen = screen
         if let data = try? Data(contentsOf: calibrationFile), let saved = try? JSONDecoder().decode(Saved.self, from: data) {
             span = Span(w: saved.w, h: saved.h)
+            transport = saved.transport ?? "usb"
             (quality, aspect) = (saved.quality, saved.aspect)
             for axis in ["x", "y"] {
                 seen[axis] = (saved.seen?[axis] ?? []).filter { $0.count == 2 }.map { ($0[0], $0[1]) }.suffix(12)
@@ -50,6 +52,22 @@ import Foundation
     }
 
     var calibrated: Bool { span != nil }
+
+    func useTransport(_ value: String) {
+        guard value != transport else { return }
+        invalidateCalibration()
+        transport = value
+    }
+
+    /// BLE and USB have different pointer acceleration; an old calibration cannot cross transports.
+    func invalidateCalibration() {
+        span = nil; pos = nil; quality = nil; aspect = nil
+        seen = ["x": [], "y": []]
+        if FileManager.default.fileExists(atPath: file.path) {
+            do { try FileManager.default.removeItem(at: file) }
+            catch { log("calibration removal failed: \(error.localizedDescription)") }
+        }
+    }
 
     private func remember(_ axis: String, _ sample: (Double, Double)) {
         seen[axis] = Array((seen[axis, default: []] + [sample]).suffix(12))  // deque(maxlen=12)
@@ -148,7 +166,7 @@ import Foundation
     private func save() {
         guard let span else { return }
         let saved = Saved(w: span.w, h: span.h, seen: seen.mapValues { $0.map { [$0.0, $0.1] } }, quality: quality,
-                          aspect: aspect)
+                          aspect: aspect, transport: transport)
         try? JSONEncoder().encode(saved).write(to: file)
     }
 
@@ -296,8 +314,9 @@ import Foundation
     /// without it (older firmware) answer an error: then Cmd+H and the flick up from the home bar (a flick, not
     /// a rest: resting opens the app switcher).
     func goHome() async throws {
-        if (try? await device.send("homescreen")) != nil { return }
-        try await key("cmd+h")
+        // The board acks Consumer Home even where iOS ignores it (and cmd+h), as on iOS 26.6: always finish with
+        // the swipe up from the bottom edge, a no-op once home.
+        _ = try? await device.send("homescreen")
         try await Task.sleep(nanoseconds: 350_000_000)
         try await swipe(0.5, 0.995, 0.5, 0.45, hold: false)
         pos = nil  // starting at the screen's edge may have clamped the pointer: re-home before the next move

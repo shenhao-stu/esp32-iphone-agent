@@ -1,0 +1,213 @@
+#include "hid_link.h"
+#include <atomic>
+#include <NimBLEDevice.h>
+#include <NimBLEHIDDevice.h>
+#include <Preferences.h>
+#include <esp_task_wdt.h>
+#include "USB.h"
+#include "USBHIDMouse.h"
+#include "USBHIDKeyboard.h"
+#include "USBHIDConsumerControl.h"
+#include "tusb.h"
+#include "src/hid/command.h"
+#include "src/hid/state.h"
+
+// One report per characteristic: IDs occur in the map/reference, never in notify payloads.
+enum { MOUSE, KEYBOARD, CONSUMER, REPORTS };
+static uint8_t reportMap[] = {
+  TUD_HID_REPORT_DESC_MOUSE(HID_REPORT_ID(1)),
+  TUD_HID_REPORT_DESC_KEYBOARD(HID_REPORT_ID(2)),
+  TUD_HID_REPORT_DESC_CONSUMER(HID_REPORT_ID(3))
+};
+static const uint8_t usbReportIDs[] = {HID_REPORT_ID_MOUSE, HID_REPORT_ID_KEYBOARD, HID_REPORT_ID_CONSUMER_CONTROL};
+static USBHIDMouse usbMouse;
+static USBHIDKeyboard usbKeyboard;
+static USBHIDConsumerControl usbConsumer;
+static USBHID usb;
+static NimBLEServer *bleServer;
+static NimBLECharacteristic *reports[REPORTS];
+static HidHostState host;
+static HidStopState stopState;
+static uint32_t activeGeneration; // main-loop command only; BLE callbacks update stopState
+static std::atomic<bool> useBLE{true};
+static uint8_t buttons;
+static Preferences prefs;
+
+class HidCallbacks : public NimBLECharacteristicCallbacks {
+  void onSubscribe(NimBLECharacteristic *c, NimBLEConnInfo &ci, uint16_t sub) override {
+    for (int i = 0; i < REPORTS; i++) {
+      if (c == reports[i] && host.subscribe(ci.getConnHandle(), i, sub & 1)) hid_request_stop();
+    }
+  }
+  void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &ci) override {
+    if (!ci.isEncrypted()) return;
+    auto value = c->getValue();
+    if (value.size() == 1) host.suspend(ci.getConnHandle(), value[0] == 0); // HID Control Point: suspend / exit suspend
+  }
+};
+static HidCallbacks hidCallbacks;
+
+void hid_begin() {
+  prefs.begin("hid", false);
+  useBLE = prefs.getBool("ble", true); // power-only USB must not redirect input to a computer
+  usbMouse.begin(); usbKeyboard.begin(); usbConsumer.begin();
+  USB.productName("HID Bridge");
+  USB.begin();
+}
+
+void hid_ble_begin(NimBLEServer *server) {
+  bleServer = server;
+  auto *device = new NimBLEHIDDevice(server);
+  device->setManufacturer("ESP32 Agent");
+  device->setPnp(2, 0x303a, 0x4001, 0x0100);
+  device->setHidInfo(0, 2);
+  device->setReportMap(reportMap, sizeof reportMap);
+  device->setBatteryLevel(100); // external supply; no battery gauge
+  for (int i = 0; i < REPORTS; i++) {
+    reports[i] = device->getInputReport(i + 1);
+    reports[i]->setCallbacks(&hidCallbacks);
+    const uint8_t empty[8] = {};
+    reports[i]->setValue(empty, i == MOUSE ? 5 : i == KEYBOARD ? 8 : 2);
+  }
+  device->getOutputReport(2); // keyboard LEDs (host writes; no physical LEDs on this bridge)
+  device->getHidControl()->setCallbacks(&hidCallbacks);
+}
+
+void hid_ble_disconnect(uint16_t handle) {
+  if (host.disconnect(handle)) hid_request_stop();
+}
+
+static bool bleReady(int report) {
+  auto state = host.snapshot();
+  if (state.owner() < 0 || !bleServer || state.suspended() || !state.subscribed(report)) return false;
+  auto ci = bleServer->getPeerInfoByHandle(state.owner());
+  return ci.isEncrypted() && ci.isBonded();
+}
+
+const char *hid_transport() { return useBLE ? "ble" : "usb"; }
+const char *hid_usb_state() { return !tud_mounted() ? "off" : tud_suspended() ? "asleep" : "ok"; }
+const char *hid_ble_state() {
+  return bleReady(MOUSE) && bleReady(KEYBOARD) && bleReady(CONSUMER) ? "ready" : host.snapshot().owner() >= 0 ? "pairing" : "off";
+}
+bool hid_ready() { return useBLE ? !strcmp(hid_ble_state(), "ready") : tud_mounted() && !tud_suspended(); }
+uint32_t hid_request_stop() { return stopState.request(); }
+uint32_t hid_generation() { return stopState.generation(); }
+static bool interrupted() { return stopState.cancelled(activeGeneration); }
+
+static bool sendReport(int report, const uint8_t *data, size_t size, bool release = false) {
+  if (!release && interrupted()) return false;
+  esp_task_wdt_reset();
+  if (!useBLE) return tud_mounted() && !tud_suspended() && usb.SendReport(usbReportIDs[report], data, size, 100);
+  if (!bleReady(report)) return false;
+  // Only retry refused notifications; an accepted relative move is never repeated.
+  int h = host.snapshot().owner();
+  for (int i = 0; i < 10 && host.snapshot().owner() == h && bleReady(report); i++) {
+    if (!release && interrupted()) return false;
+    if (reports[report]->notify(data, size, h)) return true;
+    delay(5);
+  }
+  return false;
+}
+
+static bool mouseReport(int8_t x = 0, int8_t y = 0, int8_t wheel = 0, int8_t pan = 0, bool release = false) {
+  uint8_t report[] = {buttons, (uint8_t)x, (uint8_t)y, (uint8_t)wheel, (uint8_t)pan};
+  return sendReport(MOUSE, report, sizeof report, release);
+}
+
+void hid_release_all() {
+  buttons = 0;
+  const uint8_t empty[8] = {};
+  mouseReport(0, 0, 0, 0, true);
+  sendReport(KEYBOARD, empty, 8, true);
+  sendReport(CONSUMER, empty, 2, true);
+}
+
+void hid_poll_stop() {
+  if (stopState.takeRelease()) hid_release_all();
+}
+
+String hid_select(const String &arg) {
+  if (!arg.length()) return String("ok ") + hid_transport();
+  if (arg != "ble" && arg != "usb") return "err usage: hid ble|usb";
+  bool selected = arg == "ble";
+  if (selected != useBLE) {
+    hid_release_all();
+    if (prefs.putBool("ble", selected) != 1) return "err cannot save hid transport";
+    useBLE = selected;
+  }
+  return String("ok ") + hid_transport();
+}
+
+static String failure() {
+  hid_release_all();
+  return interrupted() ? "err stopped" : "err hid report failed (state may be partial; do not retry)";
+}
+
+String hid_run(const String &line, uint32_t generation) {
+  activeGeneration = generation;
+  int space = line.indexOf(' ');
+  String cmd = space < 0 ? line : line.substring(0, space);
+  String arg = space < 0 ? "" : line.substring(space + 1);
+  if (cmd == "ping") return "ok";
+  if (cmd == "stop") { hid_release_all(); stopState.acknowledge(generation); return "ok"; }
+  if (cmd == "hid" && !arg.length()) return hid_select(arg);
+  if (interrupted()) return "err stopped (send stop to reset)";
+  if (cmd == "hid") return hid_select(arg);
+  long a = 0, b = 0;
+  uint8_t keys[8] = {}, empty[8] = {};
+  int report = MOUSE;
+  if (cmd == "move" || cmd == "scroll") {
+    if (!hid_pair(arg.c_str(), cmd == "move" ? 4000 : 127, &a, &b)) return "err invalid movement (dx dy required)";
+  } else if (cmd == "type") {
+    if (arg.length() > 480 || !hid_ascii_text(arg.c_str())) return "err type requires ASCII (max 480 bytes)";
+    report = KEYBOARD;
+  } else if (cmd == "key") {
+    if (!hid_combo(arg.c_str(), keys)) return "err invalid key combo";
+    report = KEYBOARD;
+  } else if (cmd == "homescreen") report = CONSUMER;
+  else if (cmd != "home" && cmd != "press" && cmd != "release" && cmd != "click") return "err unknown command";
+  if (useBLE && !bleReady(report)) return "err ble hid not ready (pair in iOS Bluetooth; enable AssistiveTouch)";
+  if (!useBLE && tud_suspended()) {
+    tud_remote_wakeup();
+    for (int i = 0; i < 50 && tud_suspended() && !interrupted(); i++) delay(10);
+  }
+  if (!useBLE && (!tud_mounted() || tud_suspended())) return "err phone usb asleep (connect and unlock phone)";
+  if (cmd == "home") {
+    for (int i = 0; i < 50; i++) {
+      if (interrupted() || !mouseReport(-127, -127)) return failure();
+      delay(8);
+    }
+  } else if (cmd == "move") {
+    while (a || b) {
+      int x = constrain(a, -10, 10), y = constrain(b, -10, 10);
+      if (interrupted() || !mouseReport(x, y)) return failure();
+      a -= x; b -= y; delay(8);
+    }
+  } else if (cmd == "scroll") { if (!mouseReport(0, 0, a, b)) return failure(); }
+  else if (cmd == "press" || cmd == "release" || cmd == "click") {
+    buttons = cmd == "release" ? 0 : 1;
+    if (!mouseReport()) return failure();
+    if (cmd == "click") {
+      delay(60); buttons = 0;
+      if (!mouseReport() || interrupted()) return failure();
+    }
+  } else if (cmd == "type") {
+    for (size_t i = 0; i < arg.length(); i++) {
+      hid_ascii(arg[i], &keys[2], &keys[0]);
+      if (interrupted() || !sendReport(KEYBOARD, keys, 8)) return failure();
+      delay(8);
+      if (!sendReport(KEYBOARD, empty, 8)) return failure();
+      delay(8);
+    }
+  } else if (cmd == "key") {
+    if (!sendReport(KEYBOARD, keys, 8)) return failure();
+    delay(30);
+    if (!sendReport(KEYBOARD, empty, 8) || interrupted()) return failure();
+  } else if (cmd == "homescreen") {
+    const uint8_t home[] = {0x23, 0x02};
+    if (!sendReport(CONSUMER, home, 2)) return failure();
+    delay(40);
+    if (!sendReport(CONSUMER, empty, 2) || interrupted()) return failure();
+  }
+  return "ok";
+}

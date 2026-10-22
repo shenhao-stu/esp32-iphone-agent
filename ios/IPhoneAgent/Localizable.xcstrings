@@ -1,6 +1,106 @@
 {
   "sourceLanguage" : "en",
   "strings" : {
+    "Tell me a task and I'll do it on this iPhone: I see Screen Mirroring and use a Bluetooth or USB mouse." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "告诉我一个任务，我会在这台 iPhone 上完成：通过屏幕镜像看屏幕，用蓝牙或 USB 鼠标操作。"
+          }
+        }
+      }
+    },
+    "Power On the Board" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "给小板供电"
+          }
+        }
+      }
+    },
+    "Power the board from a power bank or USB supply. Pair ESP32 Agent in iOS Settings › Bluetooth; no cable to this iPhone is needed for Bluetooth input." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "用充电宝或 USB 电源给小板供电，在 iOS 设置 › 蓝牙中配对 ESP32 Agent。蓝牙操作无需把板子接到这台 iPhone。"
+          }
+        }
+      }
+    },
+    "Enable AssistiveTouch to use the board's Bluetooth or USB pointer, then calibrate on the grid. Choose the input connection in Settings › Board." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "打开辅助触控以使用小板的蓝牙或 USB 指针，然后在网格上校准。可在设置 › 小板中选择输入连接方式。"
+          }
+        }
+      }
+    },
+    "Power on the board and keep Bluetooth enabled." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "给小板供电，并保持蓝牙开启。"
+          }
+        }
+      }
+    },
+    "Input" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "输入方式"
+          }
+        }
+      }
+    },
+    "Bluetooth HID" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "蓝牙键鼠"
+          }
+        }
+      }
+    },
+    "Independent power · Bluetooth input" : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "独立供电 · 蓝牙操作"
+          }
+        }
+      }
+    },
+    "This firmware uses USB input. Update the board firmware to enable wireless input." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "当前固件使用 USB 输入。更新小板固件后可使用无线输入。"
+          }
+        }
+      }
+    },
+    "Bluetooth: power the board from a power bank or USB supply, pair it in iOS Settings › Bluetooth, and enable AssistiveTouch. USB: connect the board to this iPhone. Recalibrate after switching. Wi-Fi carries Screen Mirroring." : {
+      "localizations" : {
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "蓝牙：用充电宝或 USB 电源给板子供电，在 iOS 设置 › 蓝牙中配对，并开启辅助触控。USB：将板子连接到这台 iPhone。切换后需要重新校准。Wi-Fi 用于传输屏幕镜像。"
+          }
+        }
+      }
+    },
     "The run is still active. Return to the Home Screen to continue." : {
       "localizations" : {
         "zh-Hans" : {

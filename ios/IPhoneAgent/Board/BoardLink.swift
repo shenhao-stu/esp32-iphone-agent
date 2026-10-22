@@ -330,6 +330,7 @@ import Foundation
         connectionDeadline?.cancel()
         connecting = false
         net = nil
+        status = nil
         let was = connected
         connected = false
         linking = false
@@ -482,6 +483,9 @@ extension BoardLink: CBPeripheralDelegate {
                         pairedID = p.identifier
                         UserDefaults.standard.set(p.identifier.uuidString, forKey: Self.pairedKey)
                         readySince = now()
+                        // Reset a latched firmware stop before any queued gestures. Legacy firmware
+                        // replies "unknown command" to id 0; no request waits for that reply.
+                        do { try write("0 stop") } catch { failConnection(error.localizedDescription); return }
                         commands.linkUp()
                         startFullStatusReads()
                         onLinkUp?()

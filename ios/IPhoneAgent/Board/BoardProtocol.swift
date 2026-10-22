@@ -23,12 +23,20 @@ struct BoardStatus: Codable, Equatable {
     var heap: Int?
     var psram: Int?
     var usb: String?   // ok | asleep | off
+    var hid: String?   // ble | usb; missing on legacy USB-only firmware
+    var hid_ready: Bool?
+    var ble_hid: String?
+    var hid_caps: String?
+
+    var inputReady: Bool { hid == nil ? usb == "ok" : hid_ready == true }
+    var inputTransport: String { hid ?? "usb" }
     var net: String?   // ap | sta | none
     var ip: String?
     var sta: Int?
     var ap: String?    // idle | connected | streaming
     var w: Int?, h: Int?
     var kbps: Double?, fps: Double?, idr: Int?, gop: Int?
+    var lag: Int?      // bytes the stream has yet to send us (-1: not streaming to us); nil on older firmware
     var ble: BLE?
 
     static func decode(_ data: Data) -> BoardStatus? { try? JSONDecoder().decode(BoardStatus.self, from: data) }
@@ -38,9 +46,12 @@ struct BoardStatus: Codable, Equatable {
     func merged(with n: BoardStatus) -> BoardStatus {
         var m = n
         m.up = n.up ?? up; m.rst = n.rst ?? rst; m.heap = n.heap ?? heap; m.psram = n.psram ?? psram
+        m.hid = n.hid ?? hid; m.ble_hid = n.ble_hid ?? ble_hid; m.hid_caps = n.hid_caps ?? hid_caps
+        // Never retain a ready flag from a different output transport.
+        m.hid_ready = n.hid_ready ?? (n.hid == nil || n.hid == hid ? hid_ready : nil)
         m.usb = n.usb ?? usb; m.net = n.net ?? net; m.ip = n.ip ?? ip; m.sta = n.sta ?? sta; m.ap = n.ap ?? ap
         m.w = n.w ?? w; m.h = n.h ?? h; m.kbps = n.kbps ?? kbps; m.fps = n.fps ?? fps; m.idr = n.idr ?? idr
-        m.gop = n.gop ?? gop
+        m.gop = n.gop ?? gop; m.lag = n.lag ?? lag
         let a = ble ?? BLE(), b = n.ble ?? BLE()
         m.ble = BLE(mtu: b.mtu ?? a.mtu, phy: b.phy ?? a.phy, kbps: b.kbps ?? a.kbps, drop: b.drop ?? a.drop)
         return m

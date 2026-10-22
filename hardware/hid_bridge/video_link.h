@@ -13,5 +13,8 @@ void video_bench(const String &id, uint32_t kb);  // replies "<id> ok <ms>"
 struct VideoStats {
   uint32_t kbps, idr_ms, gop_bytes;
   float fps;
+  uint32_t overflows, trims;  // GOP dropped whole (waits for an IDR) / front dropped while streaming
+  bool anchored;              // the buffer starts at an IDR, so a snap can be decoded
+  int32_t lag;                // bytes the stream has yet to send the app (-1: not streaming / not in sync)
 };
 VideoStats video_stats();

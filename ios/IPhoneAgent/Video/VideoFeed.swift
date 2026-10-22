@@ -128,6 +128,15 @@ extension ScreenSource {
     /// The app asked the board to forward the stream (`stream on`).
     private(set) var streamOn = false
 
+    /// iOS sends an IDR only when mirroring starts, so a frame can only be decoded from every unit since then:
+    /// in stream mode the stream stays on for as long as the board mirrors, not just during runs.
+    var keepStreaming: Bool { FrameMode.current == .stream && !MockMode.on }
+
+    /// Done with the screen for now: stop the stream unless it stays on (see `keepStreaming`).
+    func release() async throws {
+        if streamOn && !keepStreaming { try await stream(false) }
+    }
+
     /// Seconds a snap may take: the buffered GOP over the measured BLE rate, doubled, at least 8 s.
     var snapTimeout: Double {
         let gopBytes = Double(metrics?.board?.gop ?? 0)
@@ -135,14 +144,32 @@ extension ScreenSource {
         return max(8, gopBytes * 8 / 1000 / kbps * 2 + 3)
     }
 
-    /// A current frame for the model. While the board streams, the live stream has it (an IDR comes every
-    /// ~2 s): use a frame younger than `maxAge`, or wait for the next one. Snap only as a fallback, retried
-    /// once with a longer timeout. Returns where the frame came from, for the log.
+    /// A current frame for the model. While the board streams, the live stream has it: use a frame younger than
+    /// `maxAge`, or wait for the next one. AirPlay sends frames only on change, so a healthy stream with nothing new
+    /// while the board gets nothing either means the screen is unchanged. Snap only as a fallback (it resends the
+    /// whole GOP since mirroring started), retried once with a longer timeout. Returns where the frame came from.
     @discardableResult
-    func currentFrame(maxAge: Double = 1, wait: Double = 3) async throws -> String {
+    func currentFrame(maxAge: Double = 1, wait: Double = 3, catchUp: Double = 180) async throws -> String {
         if streamOn && mirroring {
             if frame != nil && now() - updated < maxAge { return "live" }
             if await fresh(since: now() - maxAge, timeout: wait) != nil { return "live (waited)" }
+            if frame != nil && !broken {
+                // The board reports how far behind our stream is: everything it has will reach us, while a snap would
+                // queue the whole GOP behind that backlog (seen: 117 s, and the phone auto-locked meanwhile).
+                if let lag = metrics?.board?.lag, lag >= 0 {
+                    if lag > Self.caughtUpBytes {
+                        DebugLog.write("frame: stream backlog \(lag / 1024) KB; waiting for it instead of snapping")
+                        guard await caughtUp(timeout: catchUp) else {
+                            throw DeviceError(message: "the screen stream did not catch up in \(Int(catchUp)) s")
+                        }
+                        await decoded()
+                        return "live (caught up)"
+                    }
+                    await decoded()
+                    return "live (unchanged)"
+                }
+                if (metrics?.board?.fps ?? 1) < 0.5 { return "live (unchanged)" }
+            }
         }
         do {
             try await snap()
@@ -151,6 +178,29 @@ extension ScreenSource {
             try await snap(timeout: snapTimeout * 1.5)
         }
         return "snap"
+    }
+
+    /// A backlog this small is a frame or two in flight, not a lag worth waiting for.
+    static let caughtUpBytes = 8 * 1024
+
+    /// Waits until the board has (almost) nothing left to stream to us, or a frame captured after we started waiting
+    /// arrives (backlog frames carry their old capture times); false on timeout or when the stream breaks, stops or
+    /// mirroring ends.
+    private func caughtUp(timeout: Double) async -> Bool {
+        let started = now(), deadline = started + timeout
+        while now() < deadline {
+            if let lag = metrics?.board?.lag, lag >= 0, lag <= Self.caughtUpBytes { return true }
+            if capturedAt > started { return true }
+            if broken || !streamOn || !mirroring { return false }
+            try? await Task.sleep(nanoseconds: 250_000_000)
+        }
+        return false
+    }
+
+    /// Lets the decoder finish what it has received, so `frame` is the newest unit.
+    private func decoded() async {
+        await withCheckedContinuation { c in decoder.queue.async { c.resume() } }
+        try? await Task.sleep(nanoseconds: 30_000_000)  // the last frame reaches the main queue
     }
 
     /// Ask the board for the current GOP and wait until it is decoded. Returns the latency in ms.
@@ -163,8 +213,7 @@ extension ScreenSource {
         } else {
             try await device.send("snap")
         }
-        await withCheckedContinuation { c in decoder.queue.async { c.resume() } }  // the GOP is decoded
-        try? await Task.sleep(nanoseconds: 30_000_000)  // let the last frame reach the main queue
+        await decoded()  // the GOP is decoded
         let ms = (now() - started) * 1000
         metrics?.snapLatency(ms)
         return ms
@@ -191,6 +240,11 @@ extension ScreenSource {
             } else {
                 await settled()
                 if await newer(than: since, timeout: 1.5) { return }
+                if let lag = metrics?.board?.lag, lag > Self.caughtUpBytes, !broken, streamOn {
+                    // the action's frames are queued behind a backlog: "unchanged" would show the model a stale screen
+                    DebugLog.write("frame: stream backlog \(lag / 1024) KB after the action; waiting for it")
+                    if await caughtUp(timeout: 180), await newer(than: since, timeout: 1.5) { return }
+                }
                 guard broken || !streamOn else { return DebugLog.write("frame: none after the action; screen unchanged") }
                 DebugLog.write("frame: stream stale (waiting for an IDR); snapping")
                 try await snap()

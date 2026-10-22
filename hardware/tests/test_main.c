@@ -4,6 +4,7 @@
 #include <string.h>
 #include "../hid_bridge/src/bplist/bplist.h"
 #include "../hid_bridge/src/video/gop.h"
+#include "../hid_bridge/src/hid/command.h"
 
 static int fails;
 #define CHECK(c) do { if (!(c)) { fails++; printf("FAIL %s:%d %s\n", __FILE__, __LINE__, #c); } } while (0)
@@ -108,6 +109,48 @@ static void test_gop(void) {
   CHECK(!avcc_to_annexb(bad, sizeof bad));
 }
 
+// iOS sends an IDR only when mirroring starts: once streamed, the oldest units are dropped to make room.
+static void test_gop_trim(void) {
+  static uint8_t arena[100];
+  static gop_au aus[4];
+  gop_buf g;
+  gop_init(&g, arena, sizeof arena, aus, 4);
+  uint8_t a[30], b[30], c[30], d[30];
+  memset(a, 'a', 30), memset(b, 'b', 30), memset(c, 'c', 30), memset(d, 'd', 30);
+  CHECK(gop_push(&g, a, 30, true, 1) == 0);
+  CHECK(gop_push(&g, b, 30, false, 2) == 1);
+  CHECK(gop_push(&g, c, 30, false, 3) == 2);
+  CHECK(!gop_fits(&g, 30) && gop_fits(&g, 10));
+  uint32_t gen = g.gen;
+  gop_drop_front(&g, 2);  // a and b were streamed
+  CHECK(g.n == 1 && g.used == 30 && g.base == 2 && g.gen == gen && g.trims == 1);
+  CHECK(g.aus[0].off == 0 && g.aus[0].ts == 3 && !g.aus[0].idr && !memcmp(arena, c, 30));
+  CHECK(gop_push(&g, d, 30, false, 4) == 1 && g.aus[1].off == 30 && !memcmp(arena + 30, d, 30));
+  gop_drop_front(&g, 0);
+  CHECK(g.n == 2 && g.base == 2 && g.trims == 1);
+  gop_drop_front(&g, 5);  // more than buffered: empties it
+  CHECK(g.n == 0 && g.used == 0 && g.base == 4 && !g.wait_idr && g.trims == 2);
+  gop_drop_front(&g, 1);  // nothing left to drop
+  CHECK(g.base == 4 && g.trims == 2);
+  CHECK(gop_push(&g, b, 30, false, 5) == 0 && g.base == 4);  // still live, not waiting for an IDR
+  CHECK(gop_push(&g, a, 30, true, 6) == 0 && g.base == 0 && g.gen == gen + 1);  // an IDR anchors it again
+}
+
+// Bytes still to stream from unit `at` (counted from the IDR): the app's backlog.
+static void test_gop_pending(void) {
+  static uint8_t arena[100];
+  static gop_au aus[4];
+  gop_buf g;
+  gop_init(&g, arena, sizeof arena, aus, 4);
+  uint8_t au[40] = {0};
+  gop_push(&g, au, 30, true, 1), gop_push(&g, au, 20, false, 2), gop_push(&g, au, 10, false, 3);
+  CHECK(gop_pending(&g, 0) == 60 && gop_pending(&g, 1) == 30 && gop_pending(&g, 2) == 10 && gop_pending(&g, 3) == 0);
+  CHECK(gop_pending(&g, 9) == 0);
+  gop_drop_front(&g, 1);  // base 1: unit 1 is now index 0
+  CHECK(gop_pending(&g, 1) == 30 && gop_pending(&g, 2) == 10);
+  CHECK(gop_pending(&g, 0) == 30);  // already dropped (sent): everything left is pending
+}
+
 static void test_chunker(void) {
   uint8_t data[100], out[64], got[100];
   for (int i = 0; i < 100; i++) data[i] = (uint8_t)i;
@@ -145,11 +188,43 @@ static void test_chunker(void) {
   CHECK(vchunk_next(&c, out, 20, 1) == 0);
 }
 
+static void test_hid_input(void) {
+  uint8_t usage = 0, modifiers = 0, report[8];
+  CHECK(hid_ascii('a', &usage, &modifiers) && usage == 4 && modifiers == 0);
+  CHECK(hid_ascii('A', &usage, &modifiers) && usage == 4 && modifiers == 2);
+  CHECK(hid_ascii('0', &usage, &modifiers) && usage == 39 && modifiers == 0);
+  CHECK(hid_ascii(')', &usage, &modifiers) && usage == 39 && modifiers == 2);
+  CHECK(hid_ascii('?', &usage, &modifiers) && usage == 56 && modifiers == 2);
+  CHECK(hid_ascii('\\', &usage, &modifiers) && usage == 49 && modifiers == 0);
+  for (unsigned ch = 32; ch <= 126; ch++) CHECK(hid_ascii(ch, &usage, &modifiers));
+  CHECK(!hid_ascii(0, &usage, &modifiers) && !hid_ascii(128, &usage, &modifiers));
+  CHECK(hid_ascii_text("Hello, GAgent!\t2026"));
+  CHECK(!hid_ascii_text("Hello 中文"));
+  CHECK(hid_combo("cmd+h", report) && report[0] == 8 && report[2] == 11 && report[3] == 0);
+  CHECK(hid_combo("shift+cmd+a", report) && report[0] == 10 && report[2] == 4);
+  CHECK(hid_combo("a+a", report) && report[2] == 4 && report[3] == 0);
+  CHECK(hid_combo("ctrl+alt+enter", report) && report[0] == 5 && report[2] == 40);
+  CHECK(!hid_combo("", report) && !hid_combo("cmd+", report) && !hid_combo("+a", report));
+  CHECK(!hid_combo("cmd+oops", report) && !hid_combo("a+b+c+d+e+f+g", report));
+  CHECK(hid_is_stop("stop") && hid_is_stop("stop now"));
+  CHECK(!hid_is_stop("stopping") && !hid_is_stop("type stop"));
+  long x, y;
+  CHECK(hid_pair("-4000 4000", 4000, &x, &y) && x == -4000 && y == 4000);
+  CHECK(!hid_pair("-4001 0", 4000, &x, &y));
+  CHECK(!hid_pair("1", 4000, &x, &y) && !hid_pair("1 ", 4000, &x, &y));
+  CHECK(!hid_pair("1 2 garbage", 4000, &x, &y));
+  CHECK(!hid_pair("1 9999999999999999999999999999999", 4000, &x, &y));
+  CHECK(!hid_pair("1 128", 127, &x, &y));
+}
+
 int main(void) {
   test_bplist_roundtrip();
   test_bplist_utf16();
   test_gop();
+  test_gop_trim();
+  test_gop_pending();
   test_chunker();
+  test_hid_input();
   printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
   return fails != 0;
 }

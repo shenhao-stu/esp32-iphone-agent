@@ -21,7 +21,31 @@ void gop_set_config(gop_buf *g, const uint8_t *annexb, size_t len, uint32_t ts) 
 static void restart(gop_buf *g) {
   g->used = 0;
   g->n = 0;
+  g->base = 0;
   g->gen++;
+}
+
+bool gop_fits(const gop_buf *g, size_t len) { return g->used + len <= g->cap && g->n < g->max; }
+
+void gop_drop_front(gop_buf *g, int k) {
+  if (k > g->n) k = g->n;
+  if (k <= 0) return;
+  uint32_t off = k < g->n ? g->aus[k].off : (uint32_t)g->used;
+  memmove(g->arena, g->arena + off, g->used - off);
+  for (int i = k; i < g->n; i++) {
+    g->aus[i - k] = g->aus[i];
+    g->aus[i - k].off -= off;
+  }
+  g->n -= k;
+  g->used -= off;
+  g->base += k;
+  g->trims++;
+}
+
+size_t gop_pending(const gop_buf *g, uint32_t at) {
+  if (at < g->base) at = g->base;
+  uint32_t i = at - g->base;
+  return i < (uint32_t)g->n ? g->used - g->aus[i].off : 0;
 }
 
 int gop_push(gop_buf *g, const uint8_t *annexb, size_t len, bool idr, uint32_t ts) {

@@ -124,13 +124,13 @@ extension AppModel {
         }
     }
 
-    /// Board connected (and USB up), plus mirroring streaming when asked; waits up to `timeout` s.
+    /// Board connected (and HID ready), plus mirroring streaming when asked; waits up to `timeout` s.
     func waitReady(mirroring: Bool, timeout: Double = 30) async -> Bool {
         if MockMode.on { return true }
         let deadline = now() + timeout
         while now() < deadline {
             let s = board.status
-            if board.connected && s?.usb == "ok" && (!mirroring || s?.ap == "streaming") { return true }
+            if board.connected && s?.inputReady == true && (!mirroring || s?.ap == "streaming") { return true }
             try? await Task.sleep(nanoseconds: 500_000_000)
         }
         return false

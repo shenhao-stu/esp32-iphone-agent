@@ -41,6 +41,23 @@ opens Clock, types the time into the wheel, ticks the days and saves. (Photo fro
 
 ## How it works
 
+### Wireless integration branch
+
+This branch adds BLE HID mouse, keyboard and Home reports on the same BLE server. New firmware
+defaults to **BLE input**; power the board separately, pair its input device in iOS Bluetooth
+settings and enable AssistiveTouch. A USB data connection to the iPhone is optional. Select
+**Settings → Board → Input → USB HID** explicitly when using a wired setup. Existing calibration
+is invalidated when the board or transport changes.
+
+The board can join the phone's existing Wi-Fi from Settings, preserving internet access for the
+model. Screen Mirroring is still required for visual actions and is managed in Control Center.
+Use one controlling app at a time. The GAgent integration reuses this board protocol with GA's
+existing model and agent loop; the standalone app below remains available.
+
+Builds and host/simulator tests pass, but BLE HID pairing, AirPlay coexistence and wireless actions
+still require physical-device acceptance. See [BLE protocol](docs/ble-protocol.md) and
+[hardware testing](hardware/tools/README.md). The original USB-based architecture is shown below.
+
 ```
 iPhone ──Screen Mirroring (Wi-Fi)──▶ ESP32-S3: AirPlay receiver ──BLE──▶ ESP32 Agent app (same iPhone)
    ▲                                    own hotspot, H.264 passthrough        decode → vision model → action

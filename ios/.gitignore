@@ -7,3 +7,5 @@ build-sim/
 fastlane/report.xml
 fastlane/README.md
 fastlane/metadata/review_information/
+
+build-wireless-tests/

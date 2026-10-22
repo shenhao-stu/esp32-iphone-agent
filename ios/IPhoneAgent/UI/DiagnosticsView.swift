@@ -57,6 +57,8 @@ struct DiagnosticsView: View {
                 row("Heap", board.status?.heap.map { "\($0 / 1024) KB" } ?? "–")
                 row("PSRAM", board.status?.psram.map { "\($0 / 1024) KB" } ?? "–")
                 row("USB", board.status?.usb ?? "–")
+                row("Input", board.status?.inputTransport ?? "–")
+                row("Bluetooth HID", board.status?.ble_hid ?? "–")
                 row("Network", "\(board.status?.net ?? "–") \(board.status?.ip ?? "")")
             }
         }

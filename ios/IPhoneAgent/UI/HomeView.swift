@@ -149,7 +149,7 @@ struct HomeView: View {
         case .failure: return "That did not work out. The replay shows where I got stuck."
         default: break
         }
-        if !board.connected { return "Plug me into the USB-C port to wake me up." }
+        if !board.connected { return "Power on the board and keep Bluetooth enabled." }
         if blocker != nil { return "Almost there. Tap an orange item to finish setup." }
         return "Hi, I'm \(settings.agentName). Tell me what to do on this iPhone."
     }

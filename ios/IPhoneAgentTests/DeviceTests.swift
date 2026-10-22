@@ -101,6 +101,68 @@ import XCTest
         XCTAssertEqual(s.fps, 4.8)
     }
 
+    func testWirelessReadinessAndLegacyFallback() throws {
+        func decode(_ json: String) throws -> BoardStatus {
+            try XCTUnwrap(BoardStatus.decode(Data(json.utf8)))
+        }
+        XCTAssertTrue(try decode(#"{"usb":"ok"}"#).inputReady)
+        XCTAssertFalse(try decode(#"{"usb":"asleep"}"#).inputReady)
+        let wireless = try decode(#"{"usb":"off","hid":"ble","hid_ready":true,"ble_hid":"ready","hid_caps":"mouse,keyboard,consumer"}"#)
+        XCTAssertTrue(wireless.inputReady)
+        XCTAssertEqual(wireless.inputTransport, "ble")
+        XCTAssertFalse(try decode(#"{"usb":"ok","hid":"ble","hid_ready":false}"#).inputReady)
+        XCTAssertFalse(try decode(#"{"usb":"ok","hid":"ble"}"#).inputReady)
+        let compact = try decode(#"{"hid":"ble","hid_ready":false,"ble_hid":"pairing"}"#)
+        let merged = wireless.merged(with: compact)
+        XCTAssertFalse(merged.inputReady)
+        XCTAssertEqual(merged.hid_caps, "mouse,keyboard,consumer")
+        XCTAssertEqual(merged.ble_hid, "pairing")
+        XCTAssertFalse(wireless.merged(with: try decode(#"{"hid":"usb"}"#)).inputReady)
+    }
+
+    func testStopBypassesAnInFlightCommand() async throws {
+        let board = FakeBoard()
+        board.silent = true
+        let channel = CommandChannel(transport: board)
+        board.channel = channel
+        let move = Task { try await channel.send("move 4000 0") }
+        while board.lines.isEmpty { await Task.yield() }
+        board.silent = false
+        try await channel.stop()
+        XCTAssertEqual(board.lines.map { $0.split(separator: " ")[1] }, ["move", "stop"])
+        move.cancel()
+        _ = await move.result
+    }
+
+    func testTimedOutClickIsNeverRepeated() async throws {
+        let board = FakeBoard()
+        board.silent = true
+        let channel = CommandChannel(transport: board)
+        board.channel = channel
+        channel.onTimeout = { _ in board.silent = false }
+        do {
+            try await channel.send("click")
+            XCTFail("a possibly executed click must report its timeout")
+        } catch is BoardTimeout {
+            XCTAssertEqual(board.lines.count, 1)
+        }
+    }
+
+    func testChangingInputInvalidatesSavedCalibration() {
+        let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")
+        let pointer = Pointer(device: FakeDevice(), calibrationFile: file)
+        pointer.finishCalibration(x: 0.5, y: 0.25)
+        pointer.useTransport("ble")
+        XCTAssertFalse(pointer.calibrated)
+        XCTAssertFalse(Pointer(device: FakeDevice(), calibrationFile: file).calibrated)
+        pointer.finishCalibration(x: 0.5, y: 0.25)
+        let reloaded = Pointer(device: FakeDevice(), calibrationFile: file)
+        reloaded.useTransport("ble")
+        XCTAssertTrue(reloaded.calibrated)
+        reloaded.useTransport("usb")
+        XCTAssertFalse(reloaded.calibrated)
+    }
+
     func testPointerRehomesEveryTenGestures() async throws {
         let device = FakeDevice()
         let file = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".json")

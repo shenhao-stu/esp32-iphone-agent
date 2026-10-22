@@ -9,6 +9,13 @@ AI 编程助手（Claude Code、Codex、Cursor、Copilot 等）：如果复制�
 
 # ESP32 iPhone Agent
 
+> 本分支新增 BLE 鼠标、键盘与 Home 键，固件默认使用蓝牙输入。板子独立供电，在 iOS 蓝牙设置
+> 配对输入设备并打开辅助触控，手机无需连接 USB 数据线；有线使用时须在 App 设置显式选择 USB HID。
+> 板子可在设置中加入手机所在 Wi-Fi。屏幕镜像仍由用户在控制中心开启或关闭，换板或切换输入方式后
+> 需要重新校准。GAgent 集成复用此协议和 GA 原有模型主循环，一次只连接一个控制 App。
+> 编译及宿主/模拟器测试已通过，真实蓝牙配对、镜像共存和无线操作仍待真机验收。下文保留原版 USB
+> 流程；无线协议和测试入口见 [BLE 协议](docs/ble-protocol.md) 与 [硬件测试](hardware/tools/README.md)。
+
 **让 AI 操作一部真实的 iPhone：只要手机和一块约 40 多元的 ESP32，不需要电脑，不用越狱。**
 
 [English](README.md) · 简体中文

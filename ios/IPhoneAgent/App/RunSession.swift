@@ -104,7 +104,10 @@ extension AppModel {
         agent.stop()
         try? await Task.sleep(nanoseconds: 100_000_000)  // let a gesture in flight finish its own release
         if board.connected && !MockMode.on {
-            do { try await pointer.reset() } catch { say("release failed: \(error.localizedDescription)") }
+            do {
+                if board.status?.hid != nil { try await board.commands.stop() }
+                else { try await pointer.reset() }
+            } catch { say("release failed: \(error.localizedDescription)") }
         }
     }
 
@@ -193,7 +196,7 @@ extension AppModel {
     func agentFinished() {
         ended()
         if let last = agent.steps.last { say("finished: \(last["action"]?.str ?? "") \(last["reason"]?.str ?? last["answer"]?.str ?? "")") }
-        Task { try? await feed.stream(false) }
+        Task { try? await feed.release() }
         endBackgroundTask()
     }
 

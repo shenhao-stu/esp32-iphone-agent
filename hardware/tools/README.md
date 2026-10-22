@@ -24,7 +24,8 @@ the Mac can join that instead, but then it has no internet.
 ```bash
 uv run hardware/tools/board_test.py info        # pairs (macOS prompt), reads `net`, prints status
 uv run hardware/tools/board_test.py bench --kb 512
-uv run hardware/tools/board_test.py hid         # moves/clicks the Mac's pointer: board is a USB mouse
+uv run hardware/tools/board_test.py cmd "hid usb" "stop"  # explicitly target the USB host (Mac)
+uv run hardware/tools/board_test.py hid         # moves/clicks the selected host's pointer
 uv run hardware/tools/board_test.py stress --seconds 20 --kb 512   # bench filler + ping/move every 200 ms
 ```
 `stress` prints reply latency p50/p95/max and missing replies (target: 0 missing, p95 < 500 ms);
@@ -50,7 +51,45 @@ uv run hardware/tools/board_test.py cmd "res 480 1040" "fps 5"   # any command l
 
 ## 4. Back to the iPhone
 
-Reflash without `--sta` (`hardware/flash.sh`), then plug the board into the iPhone.
+Reflash without `--sta` (`hardware/flash.sh`). The firmware now defaults to **BLE HID**;
+USB remains available through the explicit `hid usb` command.
+
+### Wireless setup and transport contract
+
+1. Power the board from a power bank or USB supply. The iPhone does not need a cable to the board.
+2. In iOS Settings → Bluetooth, pair **ESP32 Agent XXXX**. The app GATT link and standard
+   HID mouse/keyboard/consumer service share the same NimBLE server. Existing firmware bonds
+   may cache the old service list: forget the board in iOS, run `unpair`, then pair again if HID
+   is missing after the firmware update.
+3. Enable AssistiveTouch, connect the board Wi-Fi (or configure an existing network), and start
+   Screen Mirroring to **ESP32 Agent**. Wi-Fi carries AirPlay; it does not inject iOS touches.
+4. Connect GAgent to the board and read status. `hid=ble`, `ble_hid=ready`, `hid_ready=true`
+   mean that the encrypted, bonded HID host subscribed to mouse, keyboard and consumer reports.
+   They do not prove AssistiveTouch, pointer calibration or AirPlay is ready.
+5. After connecting/reconnecting, send `stop` to release inputs and clear a previous disconnect
+   stop. Calibrate the pointer before starting an agent task.
+
+`hid` reads the persisted selection (`ok ble` or `ok usb`). `hid ble` / `hid usb` changes it.
+There is no automatic fallback: USB power must not accidentally control the supplying computer.
+Switching sends releases on the old transport first. If USB is selected, connect the board to the
+intended iPhone USB host. Unplugging USB data does not change the selected transport.
+
+The status heartbeat preserves `usb=off|asleep|ok` and adds `hid=ble|usb`, `hid_ready` (boolean),
+`ble_hid=off|pairing|ready`, and `hid_caps="mouse,keyboard,consumer"` (full status only). Missing
+`hid` means an older USB-only firmware; clients should fall back to `usb == "ok"`.
+`pairing` also covers HID suspension or incomplete report subscriptions. Errors identify an
+unready transport, unsupported non-ASCII text, invalid coordinates, refused reports, or a stop.
+Do not automatically retry a timed-out HID command: it may have partially executed.
+
+`stop` interrupts paced moves/typing between reports and releases mouse, keyboard and consumer
+keys. Losing the app reply subscription or the HID connection latches the same interruption;
+a new `stop` clears it. `move` requires two integers in [-4000,4000], `scroll` two in [-127,127],
+`type` at most 480 ASCII bytes, and `key` validates the entire combo before pressing anything.
+These checks also apply to USB. Reports target only one bonded HID host, never every BLE peer.
+
+This wireless firmware has host-test and build verification; iPhone Bluetooth pairing, actual
+pointer/keyboard behavior, stop timing and AirPlay coexistence still require on-device acceptance.
+Do not use the Mac BLE harness at the same time as this acceptance test.
 
 ## TODO / next optimizations (measured 2026-10-15, NimBLE-Arduino 2.5.1, board on the Mac + iPhone app connected)
 

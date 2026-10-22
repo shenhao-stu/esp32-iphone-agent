@@ -29,13 +29,21 @@ typedef struct {
   uint32_t cfg_ts;
   bool wait_idr;    // overflow or start: drop until the next IDR
   uint32_t gen;     // bumps whenever the buffer restarts
-  uint32_t overflows;
+  uint32_t base;    // units dropped from the front since the IDR (0: the buffer starts at the IDR)
+  uint32_t overflows, trims;
 } gop_buf;
 
 void gop_init(gop_buf *g, uint8_t *arena, size_t cap, gop_au *aus, int max);
 void gop_set_config(gop_buf *g, const uint8_t *annexb, size_t len, uint32_t ts);
 // Appends one Annex-B access unit. Returns its index, or -1 if it was dropped.
 int gop_push(gop_buf *g, const uint8_t *annexb, size_t len, bool idr, uint32_t ts);
+// True if one more unit of len bytes fits without an overflow.
+bool gop_fits(const gop_buf *g, size_t len);
+// Drops the first k units (already streamed) to make room; gen stays, base grows. Snaps then need a new IDR.
+void gop_drop_front(gop_buf *g, int k);
+// Bytes buffered from unit `at` (counted from the IDR, i.e. base + index) to the end: what a stream at `at`
+// still has to send.
+size_t gop_pending(const gop_buf *g, uint32_t at);
 // True if the Annex-B data contains an IDR slice (NAL type 5).
 bool annexb_has_idr(const uint8_t *p, size_t len);
 // Rewrites AVCC (4-byte big-endian length prefixes) in place into Annex-B start codes.

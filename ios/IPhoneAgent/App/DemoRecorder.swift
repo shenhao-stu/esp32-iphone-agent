@@ -79,7 +79,7 @@ import UIKit
         guard recording, let folder else { return }
         loop?.cancel()
         recording = false
-        if !MockMode.on { try? await app.feed.stream(false) }
+        if !MockMode.on { try? await app.feed.release() }
         app.live.end((.thinking, String(localized: "Working out the steps…")))
         inferring = true
         let bg = UIApplication.shared.beginBackgroundTask(withName: "infer")  // stopped from the Dynamic Island

@@ -63,3 +63,60 @@ final class VideoTests: XCTestCase {
         XCTAssertEqual(units[0], Data([0x67, 1, 2]))
     }
 }
+
+/// Where `currentFrame` gets the screen while streaming. iOS sends an IDR only when mirroring starts, so a snap
+/// resends everything since then: a still screen on a healthy stream must not need one.
+@MainActor final class FeedTests: XCTestCase {
+    func feed(boardFps: Double, lag: Int? = nil) async throws -> (VideoFeed, FakeDevice) {
+        let feed = VideoFeed(), device = FakeDevice(), metrics = Metrics()
+        feed.device = device
+        feed.metrics = metrics
+        feed.mirroring = true
+        let lagField = lag.map { #","lag":\#($0)"# } ?? ""
+        metrics.status(BoardStatus.decode(Data(#"{"ap":"streaming","fps":\#(boardFps)\#(lagField)}"#.utf8))!)
+        try await feed.stream(true)
+        feed.show(Data([0xff, 0xd8]), width: 480, height: 1040)
+        return (feed, device)
+    }
+
+    func testAStillScreenUsesTheLastFrameWithoutASnap() async throws {
+        let (feed, device) = try await feed(boardFps: 0)
+        let from = try await feed.currentFrame(maxAge: 0, wait: 0.1)
+        XCTAssertEqual(from, "live (unchanged)")
+        XCTAssertEqual(device.sent, ["stream on"])
+    }
+
+    func testFramesTheAppMissedStillSnap() async throws {
+        let (feed, device) = try await feed(boardFps: 5)  // the board gets frames, none decoded here
+        let from = try await feed.currentFrame(maxAge: 0, wait: 0.1)
+        XCTAssertEqual(from, "snap")
+        XCTAssertEqual(device.sent, ["stream on", "snap"])
+    }
+
+    func testACaughtUpStreamNeedsNoSnapWhileTheScreenMoves() async throws {
+        let (feed, device) = try await feed(boardFps: 5, lag: 0)  // the board has frames, and we have them all
+        let from = try await feed.currentFrame(maxAge: 0, wait: 0.1)
+        XCTAssertEqual(from, "live (unchanged)")
+        XCTAssertEqual(device.sent, ["stream on"])
+    }
+
+    func testABacklogIsWaitedOutInsteadOfSnapped() async throws {
+        let (feed, device) = try await feed(boardFps: 5, lag: 900_000)
+        Task { @MainActor in  // the backlog drains a moment later
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            feed.metrics?.status(BoardStatus.decode(Data(#"{"ap":"streaming","fps":5,"lag":0}"#.utf8))!)
+        }
+        let from = try await feed.currentFrame(maxAge: 0, wait: 0.1, catchUp: 5)
+        XCTAssertEqual(from, "live (caught up)")
+        XCTAssertEqual(device.sent, ["stream on"])
+    }
+
+    func testABacklogThatNeverDrainsFailsInsteadOfSnapping() async throws {
+        let (feed, device) = try await feed(boardFps: 5, lag: 900_000)
+        do {
+            _ = try await feed.currentFrame(maxAge: 0, wait: 0.1, catchUp: 0.5)
+            XCTFail("expected a timeout")
+        } catch {}
+        XCTAssertEqual(device.sent, ["stream on"])
+    }
+}

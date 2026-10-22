@@ -12,6 +12,8 @@
 #include <NimBLEDevice.h>
 #include "nimble/nimble/host/include/host/ble_hs.h"
 #include "netcfg.h"
+#include "hid_link.h"
+#include "src/hid/command.h"
 
 static_assert(MYNEWT_VAL(MSYS_1_BLOCK_COUNT) == 64 && MYNEWT_VAL(MSYS_1_BLOCK_SIZE) == 320,
               "nimble_cfg.h not applied: build with hardware/flash.sh");
@@ -21,7 +23,7 @@ static_assert(MYNEWT_VAL(BLE_L2CAP_COC_MAX_NUM) == 1 && MYNEWT_VAL(BLE_L2CAP_COC
 
 #define UUID(s) "6e400001-a9e8-4b1b-9c39-6d6f8a3c" s
 const size_t CMD_MAX = 512;
-const size_t TEXT_MAX = 514;               // MTU 517 - 3
+const size_t TEXT_MAX = BLE_ATT_ATTR_MAX_LEN;  // attribute value limit, even at MTU 517
 const uint32_t VIDEO_TIMEOUT_MS = 1500;    // a full buffer waits; only a stalled link drops the chunk
 const uint32_t REPLY_TIMEOUT_MS = 3000;    // replies retry this long (video is paused meanwhile)
 const uint32_t STATUS_TIMEOUT_MS = 500;    // a newer status replaces it a second later anyway
@@ -34,16 +36,25 @@ const int MAX_PEERS = 2;
 
 enum { CH_REPLY, CH_STATUS, CH_VIDEO, CH_COUNT };
 
+struct Command {
+  uint32_t generation;
+  char line[CMD_MAX];
+};
+
 struct Text {
   uint16_t len;
   char s[TEXT_MAX];
+};
+
+struct StatusText {
+  Text full, compact;
 };
 
 static NimBLEServer *server;
 static NimBLECharacteristic *chars[CH_COUNT], *netChar;
 static QueueHandle_t cmdQueue, replyQueue;
 static SemaphoreHandle_t statusLock;
-static Text statusText;
+static StatusText statusText;
 static bool statusDirty;
 static std::atomic<int> ctrlPending;  // replies queued or sending + a status waiting; video yields to them
 static volatile int peers[MAX_PEERS] = {-1, -1};
@@ -88,10 +99,29 @@ static int indexOf(NimBLECharacteristic *c) {
   return -1;
 }
 
-static bool anySubscribed(int ch) {
-  for (int i = 0; i < MAX_PEERS; i++)
-    if (peers[i] >= 0 && subscribed[i][ch]) return true;
-  return false;
+// One eligibility rule for sizing and sending. A status-only debug link must not limit video.
+static uint16_t recipientMtu(int handle, int ch) {
+  int slot = slotOf(handle);
+  if (handle < 0 || slot < 0 || !subscribed[slot][ch]) return 0;
+  if (ch != CH_STATUS) {
+    auto ci = server->getPeerInfoByHandle(handle);
+    if (!ci.isEncrypted() || !ci.isBonded()) return 0;
+  }
+  return server->getPeerMTU(handle); // queries this handle directly; 0 if it disconnected
+}
+
+static uint16_t channelMtu(int ch) {
+  uint16_t mtu = 0;
+  for (int i = 0; i < MAX_PEERS; i++) {
+    uint16_t peerMtu = recipientMtu(peers[i], ch);
+    if (peerMtu && (!mtu || peerMtu < mtu)) mtu = peerMtu;
+  }
+  return mtu; // no eligible recipient: no notification capacity
+}
+
+static size_t notificationRoom(uint16_t mtu) {
+  size_t room = mtu > 3 ? mtu - 3 : 0;
+  return room < BLE_ATT_ATTR_MAX_LEN ? room : BLE_ATT_ATTR_MAX_LEN;
 }
 
 static void logConn(const char *what, NimBLEConnInfo &ci) {
@@ -116,10 +146,13 @@ class ServerCb : public NimBLEServerCallbacks {
   }
   void onDisconnect(NimBLEServer *s, NimBLEConnInfo &ci, int reason) override {
     int i = slotOf(ci.getConnHandle());
+    bool controlled = i >= 0 && subscribed[i][CH_REPLY];
     if (i >= 0) {
       for (int c = 0; c < CH_COUNT; c++) subscribed[i][c] = false;
       peers[i] = -1;
     }
+    hid_ble_disconnect(ci.getConnHandle());
+    if (controlled) hid_request_stop();
     BLE_LOG("disconnect conn %u, reason 0x%x\n", ci.getConnHandle(), reason);
     NimBLEDevice::startAdvertising();
   }
@@ -135,12 +168,21 @@ class CharCb : public NimBLECharacteristicCallbacks {
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &ci) override {
     const NimBLEAttValue &raw = c->getValue();
     String v(raw.c_str(), raw.length());
+    if (!ci.isEncrypted() || !ci.isBonded()) return;
     if (c == netChar) { net_request(v); return; }
-    char line[CMD_MAX] = {0};
-    v.trim();
+    if (raw.length() >= CMD_MAX || v.indexOf('\n') >= 0 || raw.length() != strlen(raw.c_str())) return;
+    Command command{};
+    char *line = command.line;
     strncpy(line, v.c_str(), CMD_MAX - 1);
-    lastCmdMs = millis();
-    if (line[0]) xQueueSend(cmdQueue, line, 0);  // full queue: the app times out and retries
+    // The app's 2 s keepalive `<id> ping` is not a command flow: arming the video cap for it held the stream
+    // at ~130-170 kbps (hardware/tools/README.md TODO) — too slow to drain a mirroring backlog.
+    const char *sp = strchr(line, ' ');
+    if (!(sp && !strcmp(sp + 1, "ping"))) lastCmdMs = millis();
+    command.generation = sp && hid_is_stop(sp + 1) ? hid_request_stop() : hid_generation();
+    if (line[0] && xQueueSend(cmdQueue, &command, 0) != pdTRUE) {
+      String id = sp ? String(line).substring(0, sp - line) : "0";
+      ble_reply(id + " err command queue full");
+    }
   }
   void onRead(NimBLECharacteristic *c, NimBLEConnInfo &ci) override {
     if (c != netChar) return;
@@ -149,7 +191,9 @@ class CharCb : public NimBLECharacteristicCallbacks {
   }
   void onSubscribe(NimBLECharacteristic *c, NimBLEConnInfo &ci, uint16_t sub) override {
     int i = indexOf(c), p = sub & 1 ? slotFor(ci.getConnHandle()) : slotOf(ci.getConnHandle());
+    bool lostControl = i == CH_REPLY && p >= 0 && subscribed[p][CH_REPLY] && !(sub & 1);
     if (i >= 0 && p >= 0) subscribed[p][i] = sub & 1;
+    if (lostControl) hid_request_stop();
     BLE_LOG("conn %u: %s %s\n", ci.getConnHandle(), sub & 1 ? "subscribed" : "unsubscribed",
             i == CH_REPLY ? "reply" : i == CH_STATUS ? "status" : "video");
   }
@@ -186,9 +230,10 @@ static int blocksFor(size_t n) { return (int)((n + 3 + 4 + 4 + 8 + MBUF_DATA - 1
 static bool notifyOne(int slot, int ch, const uint8_t *p, size_t n, uint32_t start, uint32_t timeout_ms) {
   bool video = ch == CH_VIDEO;
   int need = blocksFor(n) + (video ? MBUF_RESERVE : 0);
+  const int h = peers[slot]; // retries stay on this connection; never retarget a reused peer slot
   for (;;) {
-    int h = peers[slot];
-    if (h < 0 || !subscribed[slot][ch]) return false;
+    uint16_t mtu = recipientMtu(h, ch);
+    if (!mtu || n > notificationRoom(mtu)) return false; // never let the stack truncate a queued chunk
     if (!(video && (ctrlPending > 0 || !ctrlRoom(n))) && os_msys_num_free() >= need) {
       os_mbuf *om = ble_hs_mbuf_from_flat(p, n);
       int rc = om ? ble_gatts_notify_custom(h, chars[ch]->getHandle(), om) : BLE_HS_ENOMEM;  // om consumed
@@ -214,29 +259,41 @@ static bool notifyRaw(int ch, const uint8_t *p, size_t n, uint32_t timeout_ms) {
   return any;
 }
 
-static void sendText(int ch, const Text &t, uint32_t timeout_ms) {
-  size_t room = ble_mtu() - 3;
-  if (!notifyRaw(ch, (const uint8_t *)t.s, t.len < room ? t.len : room, timeout_ms) && ch == CH_REPLY &&
-      anySubscribed(CH_REPLY)) {
+static void sendReply(const Text &t) {
+  size_t room = notificationRoom(channelMtu(CH_REPLY));
+  if (!room) return;
+  if (!notifyRaw(CH_REPLY, (const uint8_t *)t.s, t.len < room ? t.len : room, REPLY_TIMEOUT_MS) &&
+      channelMtu(CH_REPLY)) {
     replyDrops++;
     BLE_LOG("reply dropped: %.*s\n", (int)t.len, t.s);
   }
 }
 
+static void sendStatus(const StatusText &status) {
+  uint32_t start = millis();
+  for (int i = 0; i < MAX_PEERS; i++) {
+    size_t room = notificationRoom(recipientMtu(peers[i], CH_STATUS));
+    const Text &text = status.full.len <= room ? status.full : status.compact;
+    if (!room || text.len > room) continue; // skip only this peer; never truncate JSON
+    notifyOne(i, CH_STATUS, (const uint8_t *)text.s, text.len, start, STATUS_TIMEOUT_MS);
+  }
+}
+
 static void txTask(void *) {
   static Text t;
+  static StatusText status;
   for (;;) {
     if (xQueueReceive(replyQueue, &t, pdMS_TO_TICKS(20)) == pdTRUE) {
-      sendText(CH_REPLY, t, REPLY_TIMEOUT_MS);
+      sendReply(t);
       ctrlPending--;
     }
     xSemaphoreTake(statusLock, portMAX_DELAY);
     bool due = statusDirty;
-    if (due) t = statusText;
+    if (due) status = statusText;
     statusDirty = false;
     xSemaphoreGive(statusLock);
     if (due) {
-      sendText(CH_STATUS, t, STATUS_TIMEOUT_MS);
+      sendStatus(status);
       ctrlPending--;
     }
   }
@@ -248,7 +305,7 @@ static void toText(Text &t, const String &s) {
 }
 
 void ble_begin(const String &name) {
-  cmdQueue = xQueueCreate(6, CMD_MAX);
+  cmdQueue = xQueueCreate(6, sizeof(Command));
   replyQueue = xQueueCreate(8, sizeof(Text));
   statusLock = xSemaphoreCreateMutex();
   NimBLEDevice::init(name.c_str());
@@ -266,7 +323,7 @@ void ble_begin(const String &name) {
   server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCb());
   NimBLEService *svc = server->createService(UUID("0000"));
-  NimBLECharacteristic *cmd = svc->createCharacteristic(UUID("0001"), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR);
+  NimBLECharacteristic *cmd = svc->createCharacteristic(UUID("0001"), NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::WRITE_ENC);
   chars[CH_REPLY] = svc->createCharacteristic(UUID("0002"), NIMBLE_PROPERTY::NOTIFY);
   chars[CH_STATUS] = svc->createCharacteristic(UUID("0003"), NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ);
   chars[CH_VIDEO] = svc->createCharacteristic(UUID("0004"), NIMBLE_PROPERTY::NOTIFY);
@@ -275,12 +332,15 @@ void ble_begin(const String &name) {
   cmd->setCallbacks(&charCb);
   netChar->setCallbacks(&charCb);
   for (auto *c : chars) c->setCallbacks(&charCb);
+  hid_ble_begin(server);
   server->start();
 
   NimBLEAdvertising *adv = NimBLEDevice::getAdvertising();
   NimBLEAdvertisementData data, scan;
   data.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
   data.setCompleteServices(NimBLEUUID(UUID("0000")));
+  data.addServiceUUID(NimBLEUUID((uint16_t)0x1812));
+  data.setAppearance(0x03c0);
   scan.setName(name.c_str());
   adv->setAdvertisementData(data);
   adv->setScanResponseData(scan);
@@ -294,16 +354,18 @@ void ble_begin(const String &name) {
 }
 
 bool ble_connected() { return peerCount() > 0; }
+bool ble_control_connected() { return channelMtu(CH_REPLY) != 0; }
 
-bool ble_pop_cmd(String &line, uint32_t wait_ms) {
-  char buf[CMD_MAX];
-  if (xQueueReceive(cmdQueue, buf, pdMS_TO_TICKS(wait_ms)) != pdTRUE) return false;
-  line = buf;
+bool ble_pop_cmd(String &line, uint32_t &generation, uint32_t wait_ms) {
+  Command command;
+  if (xQueueReceive(cmdQueue, &command, pdMS_TO_TICKS(wait_ms)) != pdTRUE) return false;
+  line = command.line;
+  generation = command.generation;
   return true;
 }
 
 void ble_reply(const String &line) {
-  if (!anySubscribed(CH_REPLY)) return;
+  if (!channelMtu(CH_REPLY)) return;
   Text t;
   toText(t, line);
   ctrlPending++;
@@ -313,17 +375,24 @@ void ble_reply(const String &line) {
   }
 }
 
-void ble_status(const String &json) {
-  chars[CH_STATUS]->setValue((const uint8_t *)json.c_str(), json.length());  // also served on read
-  if (!anySubscribed(CH_STATUS)) return;
+void ble_status(const String &full, const String &compact) {
+  // Characteristic reads support ATT long reads and must not inherit the notification's MTU limit.
+  chars[CH_STATUS]->setValue((const uint8_t *)full.c_str(), full.length());
+  if (!channelMtu(CH_STATUS)) return;
   xSemaphoreTake(statusLock, portMAX_DELAY);
-  toText(statusText, json);
+  toText(statusText.full, full);
+  toText(statusText.compact, compact);
   if (!statusDirty) ctrlPending++;
   statusDirty = true;
   xSemaphoreGive(statusLock);
 }
 
-size_t ble_video_room() { return anySubscribed(CH_VIDEO) ? ble_mtu() - 3 - 3 : 0; }
+uint16_t ble_video_mtu() { return channelMtu(CH_VIDEO); }
+
+size_t ble_video_room() {
+  size_t room = notificationRoom(ble_video_mtu());
+  return room > 3 ? room - 3 : 0; // seq + flags; subtraction must not wrap when nobody receives video
+}
 
 bool ble_video_send(const uint8_t *p, size_t n) {
   if (!notifyRaw(CH_VIDEO, p, n, VIDEO_TIMEOUT_MS)) {
@@ -345,7 +414,7 @@ uint32_t ble_drops() { return drops; }
 uint32_t ble_reply_drops() { return replyDrops; }
 int ble_peers() { return peerCount(); }
 
-uint16_t ble_mtu() {  // the smallest peer's, so one notify fits everyone
+uint16_t ble_mtu() {  // diagnostic minimum over all connected peers; not a channel's sending limit
   uint16_t mtu = 0;
   for (int i = 0; i < MAX_PEERS; i++) {
     int h = peers[i];

@@ -84,6 +84,8 @@ struct SettingsView: View {
 struct BoardSettingsView: View {
     @ObservedObject var app: AppModel
     @ObservedObject var board: BoardLink
+    @State private var switchingInput = false
+    @State private var inputError: String?
 
     var body: some View {
         List {
@@ -98,9 +100,33 @@ struct BoardSettingsView: View {
                 }
                 .padding(.vertical, Space.xs)
                 if board.connected, let s = board.status {
-                    ValueRow(title: "Mouse", value: s.usb ?? "–")
+                    ValueRow(title: "Mouse", value: String(localized: s.inputReady ? "Ready" : "Needs setup"))
+                    ValueRow(title: "Input", value: s.inputTransport.uppercased())
                     ValueRow(title: "Mirroring", value: s.ap ?? "–")
                 }
+            }
+            Section {
+                if board.status?.hid != nil {
+                    ForEach(["ble", "usb"], id: \.self) { transport in
+                        Button { Task { await selectInput(transport) } } label: {
+                            HStack {
+                                Text(transport == "ble" ? "Bluetooth" : "USB")
+                                Spacer()
+                                if board.status?.hid == transport { Image(systemName: "checkmark") }
+                            }
+                        }
+                        .disabled(!board.connected || switchingInput || app.agent.running || app.calibrator.busy)
+                    }
+                } else {
+                    Text("This firmware uses USB input. Update the board firmware to enable wireless input.")
+                }
+                if switchingInput { ProgressView() }
+                if let inputError { Text(verbatim: inputError).foregroundStyle(Palette.warning) }
+                if let state = board.status?.ble_hid { ValueRow(title: "Bluetooth HID", value: state) }
+            } header: {
+                Text("Input")
+            } footer: {
+                Text("Bluetooth: power the board from a power bank or USB supply, pair it in iOS Settings › Bluetooth, and enable AssistiveTouch. USB: connect the board to this iPhone. Recalibrate after switching. Wi-Fi carries Screen Mirroring.")
             }
             if board.pairedID == nil || !board.connected {
                 Section {
@@ -154,6 +180,18 @@ struct BoardSettingsView: View {
         .navigationTitle("Board")
         .navigationBarTitleDisplayMode(.inline)
         .task { await app.refreshHotspot() }
+    }
+
+    private func selectInput(_ transport: String) async {
+        guard board.status?.hid != transport, !app.agent.running, !app.calibrator.busy else { return }
+        switchingInput = true; inputError = nil
+        defer { switchingInput = false }
+        do {
+            try await board.commands.stop()
+            try await board.commands.send("hid \(transport)")
+            app.pointer.useTransport(transport)
+            try await board.refreshStatus()
+        } catch { inputError = error.localizedDescription }
     }
 }
 

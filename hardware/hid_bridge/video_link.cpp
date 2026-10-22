@@ -23,30 +23,36 @@ static uint8_t *scratch;
 static QueueHandle_t reqs;
 static TaskHandle_t task;
 static volatile bool streaming;
+// Stream position as units since the GOP's IDR (gop.base + index), so the mirror task can drop units the app
+// already has (video_on_au) while this task sends.
+static volatile uint32_t txGen = UINT32_MAX, txNext;
 static uint16_t seq;
 static uint8_t chunk[VCHUNK_HDR + MAX_CHUNK];
 static uint32_t winStart, winBytes, winFrames, lastIdr;
 static volatile uint32_t statKbps, statIdrMs, statAt;
 static volatile float statFps;
 
-// One access unit as notifies. A failed chunk still consumes its seq, so the app sees a gap.
-static bool sendAu(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts) {
+// One access unit as notifies. A failed chunk still consumes its seq, so the app sees a gap; the stream
+// retries a chunk first, as past a dropped front the GOP cannot be sent again.
+static bool sendAu(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts, int tries = 1) {
   size_t room = min(ble_video_room(), MAX_CHUNK);
   if (room < 5) return false;
   vchunk c;
   vchunk_begin(&c, p, n, flags, ts);
   for (size_t len; (len = vchunk_next(&c, chunk, room, seq)) > 0;) {
-    bool ok = ble_video_send(chunk, len);
+    bool ok = false;
+    for (int t = 0; t < tries && !ok; t++) ok = ble_video_send(chunk, len);
     seq++;
     if (!ok) return false;
   }
   return true;
 }
 
-// Copies AU i of generation gen into scratch; false if the GOP moved on.
-static bool copyAu(uint32_t gen, int i, gop_au *au) {
+// Copies unit `at` (counted from the IDR) of generation gen into scratch; false if the GOP moved on.
+static bool copyAu(uint32_t gen, uint32_t at, gop_au *au) {
   xSemaphoreTake(lock, portMAX_DELAY);
-  bool ok = gop.gen == gen && i < gop.n && gop.aus[i].len <= SCRATCH_CAP;
+  int i = (int)(at - gop.base);
+  bool ok = gop.gen == gen && at >= gop.base && i < gop.n && gop.aus[i].len <= SCRATCH_CAP;
   if (ok) {
     *au = gop.aus[i];
     memcpy(scratch, gop.arena + au->off, au->len);
@@ -55,29 +61,33 @@ static bool copyAu(uint32_t gen, int i, gop_au *au) {
   return ok;
 }
 
-// Snapshot of the GOP state: generation, AU count, SPS/PPS.
-static bool snapshot(uint32_t *gen, int *n, uint8_t *cfg, size_t *cfg_len, uint32_t *cfg_ts) {
+// Snapshot of the GOP state: generation, its first and end unit (counted from the IDR), SPS/PPS.
+static bool snapshot(uint32_t *gen, uint32_t *first, uint32_t *end, uint8_t *cfg, size_t *cfg_len,
+                     uint32_t *cfg_ts) {
   xSemaphoreTake(lock, portMAX_DELAY);
   *gen = gop.gen;
-  *n = gop.wait_idr ? 0 : gop.n;
+  *first = gop.base;
+  *end = gop.wait_idr ? gop.base : gop.base + gop.n;
   *cfg_len = gop.cfg_len;
   *cfg_ts = gop.cfg_ts;
   memcpy(cfg, gop.cfg, gop.cfg_len);
   xSemaphoreGive(lock);
-  return *n > 0 && *cfg_len > 0;
+  return *end > *first && *cfg_len > 0;
 }
 
 static String doSnap() {
   static uint8_t cfg[GOP_CFG_MAX];
   if (!ble_video_room()) return "err video not subscribed";
   for (int attempt = 0; attempt < 3; attempt++) {
-    uint32_t gen, cfg_ts;
+    uint32_t gen, first, end, cfg_ts;
     size_t cfg_len;
-    int n;
-    if (!snapshot(&gen, &n, cfg, &cfg_len, &cfg_ts)) return "err no video (start screen mirroring)";
+    bool have = snapshot(&gen, &first, &end, cfg, &cfg_len, &cfg_ts);
+    if (!cfg_len) return "err no video (start screen mirroring)";
+    // iOS sends an IDR only when mirroring starts: past an overflow (or a dropped front) only a new session has one
+    if (!have || first) return "err waiting for keyframe (restart screen mirroring)";
     if (!sendAu(cfg, cfg_len, VF_CONFIG | VF_SNAP, cfg_ts)) return "err ble send failed";
     bool complete = true;
-    for (int i = 0; i < n && complete; i++) {
+    for (uint32_t i = first; i < end && complete; i++) {
       gop_au au;
       complete = copyAu(gen, i, &au);
       if (complete && !sendAu(scratch, au.len, VF_SNAP | (au.idr ? VF_IDR : 0), au.ts)) return "err ble send failed";
@@ -107,26 +117,24 @@ static String doBench(uint32_t kb) {
 
 // Continuous mode: send every AU once, catching up from the GOP's IDR when streaming starts (P-frames
 // can't be skipped: each needs the one before, and the next IDR may be minutes away). After a failed
-// send, start over from the GOP's IDR.
+// send, start over from the GOP's IDR; once its front was dropped, only the next IDR can restart it.
 static void streamStep() {
-  static uint32_t txGen = UINT32_MAX;
-  static int next;
   static uint8_t cfg[GOP_CFG_MAX];
   if (!streaming || !ble_video_room()) {
     txGen = UINT32_MAX;  // resend config + whole GOP when streaming resumes
     return;
   }
-  uint32_t gen, cfg_ts;
+  uint32_t gen, first, end, cfg_ts;
   size_t cfg_len;
-  int n;
-  if (!snapshot(&gen, &n, cfg, &cfg_len, &cfg_ts)) return;
+  if (!snapshot(&gen, &first, &end, cfg, &cfg_len, &cfg_ts)) return;
   if (gen != txGen) {
+    if (first) return;  // no IDR left to start from (restart screen mirroring)
+    txNext = 0;
     txGen = gen;
-    next = 0;
-    if (!sendAu(cfg, cfg_len, VF_CONFIG, cfg_ts)) { txGen = UINT32_MAX; return; }
+    if (!sendAu(cfg, cfg_len, VF_CONFIG, cfg_ts, 3)) { txGen = UINT32_MAX; return; }
   }
-  for (gop_au au; next < n && copyAu(gen, next, &au); next++)
-    if (!sendAu(scratch, au.len, au.idr ? VF_IDR : 0, au.ts)) { txGen = UINT32_MAX; return; }
+  for (gop_au au; txNext < end && copyAu(gen, txNext, &au); txNext = txNext + 1)
+    if (!sendAu(scratch, au.len, au.idr ? VF_IDR : 0, au.ts, 3)) { txGen = UINT32_MAX; return; }
 }
 
 static void videoTask(void *) {
@@ -177,6 +185,10 @@ void video_on_au(const uint8_t *au, size_t len, bool idr) {
     winStart = now;
   }
   xSemaphoreTake(lock, portMAX_DELAY);
+  // iOS sends an IDR only when mirroring starts, so the GOP outgrows the buffer within minutes. While the app
+  // streams it already holds every unit sent: drop those rather than the whole GOP, and the stream stays live.
+  if (!idr && !gop.wait_idr && !gop_fits(&gop, len) && streaming && txGen == gop.gen)
+    gop_drop_front(&gop, (int)(txNext - gop.base));
   gop_push(&gop, au, len, idr, now);
   xSemaphoreGive(lock);
   xTaskNotifyGive(task);
@@ -196,7 +208,9 @@ void video_bench(const String &id, uint32_t kb) { request(id, true, kb); }
 VideoStats video_stats() {
   bool fresh = millis() - statAt < 3000;  // mirroring stopped: report zeros, not stale numbers
   xSemaphoreTake(lock, portMAX_DELAY);
-  uint32_t gopBytes = gop.used;
+  uint32_t gopBytes = gop.used, overflows = gop.overflows, trims = gop.trims;
+  bool anchored = !gop.wait_idr && gop.base == 0 && gop.n > 0;
+  int32_t lag = streaming && txGen == gop.gen ? (int32_t)gop_pending(&gop, txNext) : -1;
   xSemaphoreGive(lock);
-  return {fresh ? statKbps : 0, statIdrMs, gopBytes, fresh ? statFps : 0};
+  return {fresh ? statKbps : 0, statIdrMs, gopBytes, fresh ? statFps : 0, overflows, trims, anchored, lag};
 }

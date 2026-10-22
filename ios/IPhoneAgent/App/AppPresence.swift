@@ -10,7 +10,7 @@ extension AppModel {
     /// Leaves our own app without touching the screen: the board's Cmd+H, then its home flick as a fallback.
     /// The model is never asked to do this.
     func leaveApp() async -> Bool {
-        for method in ["cmd+h", "home swipe"] {
+        for method in ["home swipe", "cmd+h"] {
             if inBackground { return true }
             do {
                 switch method {
