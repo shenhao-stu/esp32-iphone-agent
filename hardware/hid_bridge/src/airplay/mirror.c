@@ -18,6 +18,7 @@
 #include "esp_heap_caps.h"
 #include "esp_timer.h"
 #include "mbedtls/aes.h"
+#include "ctr.h"
 #include "../video/gop.h"
 #include "ap_internal.h"
 
@@ -25,7 +26,7 @@
 #define NTP_INTERVAL_MS 3000
 
 static struct {
-  volatile bool run, done;
+  volatile bool run, done, failed, have_video;
   volatile int64_t last_data_us;
   mbedtls_aes_context aes;
   uint8_t iv[16], stream[16];
@@ -74,11 +75,19 @@ static void handle_codec(const uint8_t *p, size_t n) {
 
 static void handle_packet(const uint8_t *hdr, uint8_t *p, size_t n) {
   m.last_data_us = esp_timer_get_time();
+  if (m.failed) return;  // a broken CTR/reference chain cannot recover on a heartbeat
   if (hdr[4] == 0x01) { handle_codec(p, n); return; }
   if (hdr[4] != 0x00 || !n) return;  // 0x02/0x05: heartbeat and streaming reports
   // the keystream continues across packets, as in mirror_buffer_decrypt()
-  mbedtls_aes_crypt_ctr(&m.aes, n, &m.off, m.iv, m.stream, p, p);
-  if (!avcc_to_annexb(p, n)) { ap_log("mirror: undecodable payload (%u bytes)", (unsigned)n); return; }
+  int result = ap_aes_ctr(&m.aes, n, &m.off, m.iv, m.stream, p);
+  if (result || !avcc_to_annexb(p, n)) {
+    m.failed = true;
+    ap_log("mirror: invalid video aes=%d bytes=%u heap=%u largest=%u", result, (unsigned)n,
+           (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+           (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
+    return;
+  }
+  m.have_video = true;
   if (ap_cfg.on_au) ap_cfg.on_au(p, n, annexb_has_idr(p, n));
 }
 
@@ -176,6 +185,7 @@ bool ap_mirror_start(const uint8_t aeskey[16], uint64_t stream_id, uint32_t remo
   mbedtls_aes_init(&m.aes);
   mbedtls_aes_setkey_enc(&m.aes, key, 128);
   m.off = 0;
+  m.failed = m.have_video = false;
   m.remote_ip = remote_ip;
   m.timing_rport = timing_rport;
   m.last_data_us = 0;
@@ -205,7 +215,9 @@ void ap_mirror_stop(void) {
 }
 
 bool ap_mirror_running(void) { return m.run; }
+bool ap_mirror_failed(void) { return m.run && m.failed; }
 
 bool ap_mirror_streaming(void) {
-  return m.run && m.last_data_us && esp_timer_get_time() - m.last_data_us < 3000000;
+  return m.run && !m.failed && m.have_video && m.last_data_us
+      && esp_timer_get_time() - m.last_data_us < 3000000;
 }

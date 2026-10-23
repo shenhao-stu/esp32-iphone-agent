@@ -7,10 +7,14 @@
 #include "ble_link.h"
 #include "netcfg.h"
 #include "video_link.h"
+#include "video_net.h"
 #include "src/airplay/airplay.h"
 
 #ifndef DEBUG_SERIAL
 #define DEBUG_SERIAL 0
+#endif
+#if DEBUG_SERIAL
+#include "crypto_probe.h"
 #endif
 const int WATCHDOG_MS = 8000;
 static String receiverName = "ESP32 Agent";
@@ -37,6 +41,7 @@ String board(const String &line, const String &id, uint32_t generation) {
   int n = sscanf(arg.c_str(), "%ld %ld", &a, &b);
   if (cmd == "status" && !arg.length()) return "ok " + statusJson(true);
   if (cmd == "link" && !arg.length()) return "ok " + ble_link_info();
+  if (cmd == "vnet") return video_net_offer(arg);
   if (cmd == "phy") {
     if (arg != "1" && arg != "2") return "err usage: phy 1|2";
     return ble_request_phy(arg == "2" ? 2 : 1);
@@ -51,9 +56,9 @@ String board(const String &line, const String &id, uint32_t generation) {
     return "ok";
   }
   if (cmd == "snap") { video_snap(id); return ""; }  // replies when the GOP is sent
-  if (cmd == "bench") {
+  if (cmd == "bench" || cmd == "wbench") {
     if (n < 1 || a <= 0 || a > 4096) return "err usage: bench KB (1-4096)";
-    video_bench(id, a);
+    video_bench(id, a, cmd == "wbench");
     return "";
   }
   if (cmd == "res") {
@@ -81,17 +86,18 @@ String board(const String &line, const String &id, uint32_t generation) {
 }
 
 String statusJson(bool full) {
-  static const char *apStates[] = {"idle", "connected", "streaming"};
+  static const char *apStates[] = {"idle", "connected", "streaming", "failed"};
   VideoStats v = video_stats();
-  char s[640];
+  char s[768];
   snprintf(s, sizeof s,
            "{\"hid_caps\":\"mouse,keyboard,consumer\",\"up\":%lu,\"rst\":\"%s\",\"heap\":%u,\"psram\":%u,\"usb\":\"%s\",\"hid\":\"%s\",\"hid_ready\":%s,\"ble_hid\":\"%s\",\"net\":\"%s\",\"ip\":\"%s\",\"sta\":%d,"
            "\"ap\":\"%s\",\"w\":%u,\"h\":%u,\"kbps\":%lu,\"fps\":%.1f,\"idr\":%lu,\"gop\":%lu,\"ovf\":%lu,\"trim\":%lu,"
-           "\"anc\":%d,\"lag\":%ld,\"ble\":{\"mtu\":%u,\"vmtu\":%u,\"phy\":%u,\"kbps\":%lu,\"drop\":%lu,\"rdrop\":%lu,\"n\":%d}}",
+           "\"anc\":%d,\"lag\":%ld,\"vnet\":1,\"vtransport\":\"%s\",\"vkbps\":%lu,\"ble\":{\"mtu\":%u,\"vmtu\":%u,\"phy\":%u,\"kbps\":%lu,\"drop\":%lu,\"rdrop\":%lu,\"n\":%d}}",
            millis(), resetReason(), (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
            (unsigned)heap_caps_get_free_size(MALLOC_CAP_SPIRAM), hid_usb_state(), hid_transport(), hid_ready() ? "true" : "false", hid_ble_state(), net_mode(), net_ip().c_str(), net_peers(),
            apStates[airplay_state()], cfg_width(), cfg_height(), (unsigned long)v.kbps, v.fps, (unsigned long)v.idr_ms,
            (unsigned long)v.gop_bytes, (unsigned long)v.overflows, (unsigned long)v.trims, v.anchored ? 1 : 0, (long)v.lag,
+           video_net_ready() ? "wifi" : "ble", (unsigned long)video_net_kbps(),
            ble_mtu(), ble_video_mtu(), ble_phy(), (unsigned long)ble_kbps(), (unsigned long)ble_drops(),
            (unsigned long)ble_reply_drops(), ble_peers());
   if (full) return s;
@@ -155,13 +161,20 @@ void loop() {
   esp_task_wdt_reset();
   net_poll();
   hid_poll_stop();
-  if (linked && !ble_control_connected()) video_stream(false);
+  if (linked && !ble_control_connected()) { video_stream(false); video_net_close(); }
   linked = ble_control_connected();
 
   String line;
   if (Serial.available()) {  // USB serial takes the same `<id> <command>` lines, for debugging from a Mac
     line = Serial.readStringUntil('\n');
     if (line.endsWith("\r")) line.remove(line.length() - 1);
+#if DEBUG_SERIAL
+    if (line == "0 crypto-test" || line == "0 crypto-pressure-test") {
+      if (airplay_state() == AIRPLAY_IDLE) crypto_probe(line == "0 crypto-pressure-test");
+      else Serial.println("crypto-test: stop screen mirroring first");
+      return;
+    }
+#endif
     if (line.startsWith("0 net ")) { net_request(line.substring(6)); Serial.println("0 ok"); return; }
     int sp = line.indexOf(' ');
     String id = sp < 0 ? line : line.substring(0, sp);
@@ -181,6 +194,7 @@ void loop() {
   String reply = id.toInt() || id == "0" ? board(rest, id, generation) : "err missing request id";
   if (reply.length()) ble_reply(id + " " + reply);
 #if DEBUG_SERIAL
-  Serial.printf("%s -> %s (%lu ms)\n", line.c_str(), reply.c_str(), millis() - started);
+  Serial.printf("%s -> %s (%lu ms)\n", rest.startsWith("vnet ") ? "vnet [redacted]" : line.c_str(),
+                reply.c_str(), millis() - started);
 #endif
 }

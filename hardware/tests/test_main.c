@@ -217,6 +217,32 @@ static void test_hid_input(void) {
   CHECK(!hid_pair("1 128", 127, &x, &y));
 }
 
+static void test_wifi_chunker(void) {
+  uint8_t data[32769], out[16003], got[32769];
+  for (size_t i = 0; i < sizeof data; i++) data[i] = (uint8_t)(i * 17);
+  vchunk c;
+  vchunk_begin(&c, data, sizeof data, VF_IDR, 0x12345678);
+  size_t n, received = 0;
+  uint16_t seq = 65535;
+  while ((n = vchunk_next(&c, out, 16000, seq)) > 0) {
+    CHECK(n <= sizeof out);
+    CHECK(((uint16_t)out[0] | (uint16_t)out[1] << 8) == seq);
+    size_t offset = VCHUNK_HDR;
+    if (!received) {
+      CHECK(out[2] & VF_START);
+      CHECK(out[3] == 0x78 && out[6] == 0x12);
+      offset += 4;
+    } else CHECK(!(out[2] & VF_START));
+    CHECK(received + n - offset <= sizeof got);
+    memcpy(got + received, out + offset, n - offset);
+    received += n - offset;
+    CHECK((bool)(out[2] & VF_END) == (received == sizeof data));
+    seq++;
+  }
+  CHECK(received == sizeof data && !memcmp(data, got, sizeof data));
+  CHECK(seq == 2);
+}
+
 int main(void) {
   test_bplist_roundtrip();
   test_bplist_utf16();
@@ -224,6 +250,7 @@ int main(void) {
   test_gop_trim();
   test_gop_pending();
   test_chunker();
+  test_wifi_chunker();
   test_hid_input();
   printf(fails ? "%d FAILED\n" : "all tests passed\n", fails);
   return fails != 0;

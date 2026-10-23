@@ -51,6 +51,7 @@ void fairplay_decrypt(const uint8_t keymsg[164], const uint8_t in[72], uint8_t o
 bool ap_mirror_start(const uint8_t aeskey[16], uint64_t stream_id, uint32_t remote_ip, uint16_t timing_rport);
 void ap_mirror_stop(void);
 bool ap_mirror_running(void);
+bool ap_mirror_failed(void);
 bool ap_mirror_streaming(void);
 
 // ---- mdns.c ----

@@ -8,7 +8,7 @@ void video_on_config(const uint8_t *sps_pps, size_t len);  // AirPlay callbacks 
 void video_on_au(const uint8_t *au, size_t len, bool idr);
 void video_stream(bool on);
 void video_snap(const String &id);               // replies "<id> ok" when the GOP is sent
-void video_bench(const String &id, uint32_t kb);  // replies "<id> ok <ms>"
+void video_bench(const String &id, uint32_t kb, bool wifi = false);  // replies "<id> ok <ms>"
 
 struct VideoStats {
   uint32_t kbps, idr_ms, gop_bytes;

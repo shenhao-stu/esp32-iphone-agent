@@ -46,7 +46,7 @@ When the link drops, the board releases all buttons/keys (same as before).
 {"up":123456,"rst":"power-on","heap":81234,"psram":6200000,"usb":"ok|asleep|off",
  "net":"ap|sta|none","ip":"192.168.4.1","sta":1,
  "hid":"ble|usb","hid_ready":false,"ble_hid":"off|pairing|ready","hid_caps":"mouse,keyboard,consumer",
- "ap":"idle|connected|streaming","w":480,"h":1040,"kbps":180,"fps":4.8,"idr":2000,"gop":42000,
+ "ap":"idle|connected|streaming|failed","w":480,"h":1040,"kbps":180,"fps":4.8,"idr":2000,"gop":42000,
  "ovf":0,"trim":0,"anc":1,"lag":0,
  "ble":{"mtu":247,"vmtu":247,"phy":1,"kbps":350,"drop":0,"rdrop":0,"n":1}}
 ```
@@ -107,3 +107,19 @@ Receiver name `ESP32 Agent`, mirroring only (no audio), H.264 only, resolution/f
 - `net` read in `sta` mode returns the station network's `ssid`/`pass`.
 - `snap` while mirroring has stopped returns the last buffered GOP (check `"ap"` in status); `snap` without
   any video replies `err no video ...`.
+
+## Wi-Fi video (v1)
+
+New firmware advertises `vnet:1` in full status. The paired app can send `vnet <64 lowercase hex characters>` over the existing encrypted, bonded command characteristic. The value is a fresh 32-byte random key for this connection, never a saved Wi-Fi password. Reply: `ok 7002`. Keys and commands containing them must not be logged. `vnet off`, loss of the BLE controller, an authentication/I/O failure, or a new offer closes the old session. A pending offer expires after 10 seconds.
+
+TCP port 7002 requires TLS 1.2, identity `gagent-video-v1`, cipher `TLS_PSK_WITH_AES_128_GCM_SHA256`; there is no plaintext video endpoint or certificate verification bypass for certificate-based TLS. The PSK authenticates both peers. One client consumes an offer. Reconnection uses a fresh key. Only the video task touches TLS/socket state; the command task passes a bounded offer. The stock SDK allocates two 16KiB TLS buffers; setup fails if less than 12KiB internal heap remains.
+
+AirPlay CTR decryption uses a fixed 1KiB internal working buffer, preserving counter/offset/partial keystream across chunks and packets. This avoids transient PSRAM DMA staging allocations under TLS/Wi-Fi memory pressure. Any AES or AVCC validation error latches `ap:failed` until the next mirroring session. Clients must invalidate the old frame and stop actions; heartbeat traffic alone does not prove a usable video chain. A live but quiet session can report `connected` after three seconds without data: disable frame-dependent actions until `streaming` resumes, but retain the decoder reference chain. Clear it on `idle` or `failed`, not on this transient state.
+
+Debug builds offer serial-only `0 crypto-test` (ECB-reference versus CTR, synthetic public key/data) and explicit `0 crypto-pressure-test` (also reserves internal heap to reproduce allocation failures). Both require AirPlay idle. The pressure test can interrupt the video socket and is a fault-injection check, never a throughput/stability result; reconnect the app afterwards. It never reads a user's video or session keys. These commands are absent from release builds and BLE commands.
+
+Inside TLS: `[length u16 BE][video chunk]`, length 3–16003. Chunks retain the BLE sequence/flags/timestamp format. Each access unit chooses one transport. The app stops the old stream and resets its assembler before switching, avoiding mixed BLE/Wi-Fi fragments. `stream on/off` and `snap` use authenticated Wi-Fi when ready, otherwise BLE. H.264 reference units are never skipped. `vtransport` reports `wifi` or `ble`, `vkbps` reports Wi-Fi video bytes per second ×8/1000; `ble.kbps` remains BLE-only. `lag` still measures pending source bytes, not TLS/TCP buffers.
+
+`wbench KB` sends the same 0xA5 diagnostic payload as `bench` over authenticated Wi-Fi; `bench` remains BLE-only. `hardware/tools/wifi_video_probe.py` checks wrong-key rejection, record sequence, payload integrity and rate without viewing the phone. USB serial in this harness is only for setup/replies; all measured bytes travel over Wi-Fi. A synthetic test with AirPlay off is not concurrent mirroring or long-term acceptance.
+
+Transport loss does not make P-frames independently decodable. Once the board has trimmed the IDR, a restarted decoder still needs a new mirror session. The app explains that recovery and blocks actions on stale frames.

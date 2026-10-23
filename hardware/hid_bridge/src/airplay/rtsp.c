@@ -49,6 +49,7 @@ void ap_resp_header(ap_resp *r, const char *name, const char *val) {
 }
 
 int airplay_state(void) {
+  if (ap_mirror_failed()) return AIRPLAY_FAILED;
   if (ap_mirror_streaming()) return AIRPLAY_STREAMING;
   for (int i = 0; i < MAX_CONNS; i++)
     if (conns[i].fd >= 0 && (conns[i].have_keymsg || ap_mirror_owner == &conns[i])) return AIRPLAY_CONNECTED;
