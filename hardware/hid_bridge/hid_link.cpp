@@ -170,8 +170,15 @@ String hid_run(const String &line, uint32_t generation) {
   long a = 0, b = 0;
   uint8_t keys[8] = {}, empty[8] = {};
   int report = MOUSE;
-  if (cmd == "move" || cmd == "scroll") {
-    if (!hid_pair(arg.c_str(), cmd == "move" ? 4000 : 127, &a, &b)) return "err invalid movement (dx dy required)";
+  long step = 10;  // units per 8 ms report; flick may go faster ("flick dx dy step")
+  if (cmd == "move" || cmd == "scroll" || cmd == "flick") {
+    int third = arg.indexOf(' ', arg.indexOf(' ') + 1);
+    if (cmd == "flick" && third > 0) {
+      step = arg.substring(third + 1).toInt();
+      if (step < 1 || step > 60) return "err flick step must be 1-60";
+      arg = arg.substring(0, third);
+    }
+    if (!hid_pair(arg.c_str(), cmd == "scroll" ? 127 : 4000, &a, &b)) return "err invalid movement (dx dy required)";
   } else if (cmd == "type") {
     if (arg.length() > 480 || !hid_ascii_text(arg.c_str())) return "err type requires ASCII (max 480 bytes)";
     report = KEYBOARD;
@@ -191,12 +198,16 @@ String hid_run(const String &line, uint32_t generation) {
       if (interrupted() || !mouseReport(-127, -127)) return failure();
       delay(8);
     }
-  } else if (cmd == "move") {
+  } else if (cmd == "move" || cmd == "flick") {
+    // flick: press, move and release in one command, so no link round trip pauses the finger before
+    // lifting; iOS reads a pause at the end of an edge swipe as hold (App Switcher instead of Home).
+    if (cmd == "flick") { buttons = 1; if (!mouseReport()) return failure(); delay(8); }
     while (a || b) {
-      int x = constrain(a, -10, 10), y = constrain(b, -10, 10);
+      int x = constrain(a, -step, step), y = constrain(b, -step, step);
       if (interrupted() || !mouseReport(x, y)) return failure();
       a -= x; b -= y; delay(8);
     }
+    if (cmd == "flick") { buttons = 0; if (!mouseReport()) return failure(); }
   } else if (cmd == "scroll") { if (!mouseReport(0, 0, a, b)) return failure(); }
   else if (cmd == "press" || cmd == "release" || cmd == "click") {
     buttons = cmd == "release" ? 0 : 1;
