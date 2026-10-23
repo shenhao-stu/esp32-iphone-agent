@@ -14,6 +14,7 @@
 #endif
 const int WATCHDOG_MS = 8000;
 static String receiverName = "ESP32 Agent";
+String statusJson(bool full);
 
 const char *resetReason() {
   switch (esp_reset_reason()) {
@@ -34,6 +35,12 @@ String board(const String &line, const String &id, uint32_t generation) {
   String arg = sp < 0 ? "" : line.substring(sp + 1);
   long a = 0, b = 0;
   int n = sscanf(arg.c_str(), "%ld %ld", &a, &b);
+  if (cmd == "status" && !arg.length()) return "ok " + statusJson(true);
+  if (cmd == "link" && !arg.length()) return "ok " + ble_link_info();
+  if (cmd == "phy") {
+    if (arg != "1" && arg != "2") return "err usage: phy 1|2";
+    return ble_request_phy(arg == "2" ? 2 : 1);
+  }
   if (cmd == "stream") {
     if (arg != "on" && arg != "off") return "err usage: stream on|off";
     video_stream(arg == "on");

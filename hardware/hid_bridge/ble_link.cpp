@@ -431,6 +431,35 @@ uint8_t ble_phy() {
   return tx == BLE_GAP_LE_PHY_2M ? 2 : 1;
 }
 
+String ble_link_info() {
+  String result = "[";
+  for (int i = 0; i < MAX_PEERS; i++) {
+    int h = peers[i];
+    if (h < 0) continue;
+    auto ci = server->getPeerInfoByHandle(h);
+    uint8_t tx = 0, rx = 0;
+    ble_gap_read_le_phy(h, &tx, &rx);
+    char json[240];
+    snprintf(json, sizeof json,
+             "{\"handle\":%d,\"mtu\":%u,\"tx_phy\":%u,\"rx_phy\":%u,\"interval_ms\":%.2f,\"latency\":%u,\"timeout_ms\":%u,\"encrypted\":%s,\"video\":%s}",
+             h, ci.getMTU(), tx, rx, ci.getConnInterval() * 1.25f, ci.getConnLatency(), ci.getConnTimeout() * 10u,
+             ci.isEncrypted() ? "true" : "false", recipientMtu(h, CH_VIDEO) ? "true" : "false");
+    if (result.length() > 1) result += ',';
+    result += json;
+  }
+  return result + ']';
+}
+
+String ble_request_phy(uint8_t phy) {
+  if (phy != 1 && phy != 2) return "err usage: phy 1|2";
+  // A comparison must not silently measure a second central or change its link.
+  if (peerCount() != 1) return "err PHY test requires exactly one connected phone";
+  int h = peers[0] >= 0 ? peers[0] : peers[1];
+  if (!recipientMtu(h, CH_VIDEO)) return "err phone video subscription is not ready";
+  uint8_t mask = phy == 2 ? BLE_GAP_LE_PHY_2M_MASK : BLE_GAP_LE_PHY_1M_MASK;
+  return server->updatePhy(h, mask, mask, 0) ? "ok requested (verify with link)" : "err PHY request rejected";
+}
+
 void ble_unpair() {
   for (int i = 0; i < 100 && ctrlPending > 0; i++) vTaskDelay(pdMS_TO_TICKS(10));  // let the `ok` go out
   NimBLEDevice::deleteAllBonds();  // unpairs each bond (also drops it from the controller's resolving list)

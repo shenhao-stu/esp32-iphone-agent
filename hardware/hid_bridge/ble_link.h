@@ -18,6 +18,8 @@ void ble_unpair();
 uint16_t ble_mtu();          // diagnostic minimum over connected peers; 23 with none
 uint16_t ble_video_mtu();    // minimum over encrypted, bonded video subscribers; 0 with none
 uint8_t ble_phy();       // 1 or 2 (Mbit)
+String ble_link_info();  // actual negotiated parameters; no addresses or keys
+String ble_request_phy(uint8_t phy); // one video recipient only; not persisted
 uint32_t ble_kbps();     // video bytes out, last second
 uint32_t ble_drops();    // video notifies we failed to send
 uint32_t ble_reply_drops();  // replies that never got out to a subscribed peer

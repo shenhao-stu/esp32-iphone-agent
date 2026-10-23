@@ -36,7 +36,12 @@ static Preferences prefs;
 class HidCallbacks : public NimBLECharacteristicCallbacks {
   void onSubscribe(NimBLECharacteristic *c, NimBLEConnInfo &ci, uint16_t sub) override {
     for (int i = 0; i < REPORTS; i++) {
-      if (c == reports[i] && host.subscribe(ci.getConnHandle(), i, sub & 1)) hid_request_stop();
+      if (c != reports[i]) continue;
+      if (host.subscribe(ci.getConnHandle(), i, sub & 1)) hid_request_stop();
+#if DEBUG_SERIAL
+      Serial.printf("hid: conn %u report %d subscribed=%u encrypted=%d bonded=%d\n",
+                    ci.getConnHandle(), i + 1, sub & 1, ci.isEncrypted(), ci.isBonded());
+#endif
     }
   }
   void onWrite(NimBLECharacteristic *c, NimBLEConnInfo &ci) override {

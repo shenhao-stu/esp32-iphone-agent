@@ -37,3 +37,13 @@ MTU 247 的 ATT 包可放进一个 DLE 251 字节载荷（另有4字节L2CAP头�
 - [Apple maximumWriteValueLength](https://developer.apple.com/documentation/corebluetooth/cbperipheral/maximumwritevaluelength(for:))：按系统报告的写入长度使用CoreBluetooth。
 - 固件 agent 另核对本机 NimBLE 源码与 Bluetooth ATT 属性512字节上限；回归及构建证据见
   `work/integration-20261023/firmware-report.md` 和 `firmware-review.md`（相对IOSAgent根目录）。
+
+## 可复现诊断入口（2026-10-23 补充）
+
+新增串口/已配对 GATT 命令：
+
+- `status`：完整状态 JSON（小 MTU 上请使用已有 status 属性长读，避免命令回复受通知长度限制）。
+- `link`：各连接的实际 MTU、TX/RX PHY、连接间隔、latency、supervision timeout、加密和视频订阅状态；不包含地址或密钥。
+- `phy 1|2`：只在恰好一个连接且已加密订阅视频时请求改变 PHY。回复 `requested` 不是协商成功，必须再读 `link`。设置不持久化，启动仍以 1M 为默认。
+
+`--debug` 固件会记录各 HID report 的订阅，帮助区分“App 控制已连”和“系统鼠标已就绪”。新增这些能力不等于已经取得 1M/2M 实测结果。
