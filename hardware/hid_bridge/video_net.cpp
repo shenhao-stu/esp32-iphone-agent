@@ -1,5 +1,6 @@
 #include "video_net.h"
 #include "netcfg.h"
+#include "src/video/write_deadline.h"
 #include <atomic>
 #include <esp_random.h>
 #include <esp_heap_caps.h>
@@ -23,6 +24,7 @@ static bool initialized, armed;
 static std::atomic<bool> ready;
 static uint32_t deadline, windowAt, windowBytes;
 static std::atomic<uint32_t> rate, rateAt;
+static uint32_t socketProgress;
 
 static void closePeer() {
   ready = false;
@@ -35,6 +37,7 @@ static int writeSocket(void *, const unsigned char *p, size_t n) {
   // lwIP's nonblocking send can reject a whole TLS record larger than TCP_SND_BUF.
   // Partial writes let TLS advance using the available TCP window.
   int result = send(peer, p, min(n, (size_t)1460), 0);
+  if (result > 0) socketProgress = millis();
   return result >= 0 ? result : errno == EAGAIN || errno == EWOULDBLOCK
       ? MBEDTLS_ERR_SSL_WANT_WRITE : MBEDTLS_ERR_SSL_INTERNAL_ERROR;
 }
@@ -155,19 +158,24 @@ void video_net_poll() {
 bool video_net_ready() { return ready && applied == revision.load(); }
 
 static bool writeAll(const uint8_t *p, size_t length) {
-  uint32_t until = millis() + 2000;
+  VideoWriteDeadline deadline(millis());
+  socketProgress = deadline.started;
   int result = 0;
   while (length && video_net_ready()) {
     int n = mbedtls_ssl_write(&tls, p, length);
     result = n;
+    // TLS may return WANT_WRITE after its BIO sent part of a record. Track TCP progress,
+    // not just completed TLS records; retry with the same buffer until TLS accepts it.
+    deadline.progress(socketProgress);
     if (n > 0) { p += n; length -= n; continue; }
     if ((n != MBEDTLS_ERR_SSL_WANT_WRITE && n != MBEDTLS_ERR_SSL_WANT_READ) ||
-        (int32_t)(millis() - until) >= 0) break;
+        deadline.expired(millis())) break;
     vTaskDelay(pdMS_TO_TICKS(1));
   }
   if (!length) return true;
-  Serial.printf("video Wi-Fi: write failed tls=%d errno=%d heap=%u remaining=%u\n", result, errno,
-                (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)length);
+  Serial.printf("video Wi-Fi: write failed tls=%d errno=%d heap=%u remaining=%u elapsed=%u stalled=%u\n",
+                result, errno, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)length,
+                (unsigned)(millis() - deadline.started), (unsigned)(millis() - socketProgress));
   closePeer(); armed = false;
   return false;
 }

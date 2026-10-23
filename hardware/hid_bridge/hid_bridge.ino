@@ -6,6 +6,7 @@
 #include "src/hid/command.h"
 #include "ble_link.h"
 #include "netcfg.h"
+#include "net_scan.h"
 #include "video_link.h"
 #include "video_net.h"
 #include "src/airplay/airplay.h"
@@ -42,6 +43,7 @@ String board(const String &line, const String &id, uint32_t generation) {
   if (cmd == "status" && !arg.length()) return "ok " + statusJson(true);
   if (cmd == "link" && !arg.length()) return "ok " + ble_link_info();
   if (cmd == "vnet") return video_net_offer(arg);
+  if (cmd == "wifi-scan") return net_scan_command(arg);
   if (cmd == "phy") {
     if (arg != "1" && arg != "2") return "err usage: phy 1|2";
     return ble_request_phy(arg == "2" ? 2 : 1);

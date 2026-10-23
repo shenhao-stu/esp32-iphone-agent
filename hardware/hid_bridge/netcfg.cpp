@@ -1,5 +1,6 @@
 // Board settings in NVS and the Wi-Fi link, see netcfg.h.
 #include "netcfg.h"
+#include "net_scan.h"
 #include <WiFi.h>
 #include <Preferences.h>
 #include <esp_mac.h>
@@ -73,6 +74,7 @@ static void noDefaultRoute() {
 }
 
 static void startWifi() {
+  net_scan_cancel();
   WiFi.disconnect(true);
   WiFi.softAPdisconnect(true);
   WiFi.setHostname("iphone-agent");
@@ -174,7 +176,8 @@ static void retrySta() {
 }
 
 void net_poll() {
-  retrySta();
+  net_scan_poll();
+  if (!net_scan_running()) retrySta();
   xSemaphoreTake(pendingLock, portMAX_DELAY);
   String j = pending;
   pending = "";

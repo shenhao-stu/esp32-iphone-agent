@@ -123,3 +123,11 @@ Inside TLS: `[length u16 BE][video chunk]`, length 3–16003. Chunks retain the 
 `wbench KB` sends the same 0xA5 diagnostic payload as `bench` over authenticated Wi-Fi; `bench` remains BLE-only. `hardware/tools/wifi_video_probe.py` checks wrong-key rejection, record sequence, payload integrity and rate without viewing the phone. USB serial in this harness is only for setup/replies; all measured bytes travel over Wi-Fi. A synthetic test with AirPlay off is not concurrent mirroring or long-term acceptance.
 
 Transport loss does not make P-frames independently decodable. Once the board has trimmed the IDR, a restarted decoder still needs a new mirror session. The app explains that recovery and blocks actions on stale frames.
+
+## Nearby Wi-Fi discovery
+
+`wifi-scan start` begins an asynchronous board-side scan and replies with a numeric revision. `wifi-scan` returns `{"id":1,"state":"scanning|ready|failed|idle","count":0}`. Once ready, `wifi-scan <revision> <index>` returns one `{"ssid":"Home","rssi":-50,"secure":true,"supported":true}` record. Each record fits one reply; at most 20 unique visible SSIDs are retained, strongest first. A stale revision or out-of-range index is rejected. No passwords are returned or saved by scanning.
+
+Only loop() owns scan state. Scans time out after 10 seconds, release the driver's results, and suspend STA reconnect attempts until finished. Starting a new network configuration cancels the scan. AP mode temporarily enables STA scanning and restores AP-only mode afterwards; existing credentials and NVS are preserved. Scanning is rejected while AirPlay is active to avoid disrupting its shared radio. Hidden SSIDs remain manual input; enterprise/WEP authentication is shown as unsupported.
+
+TLS writes allow at most 2 seconds without TCP BIO progress and 10 seconds overall. A partial socket write resets the idle deadline even when TLS still returns WANT_WRITE; the caller retains the same TLS buffer until accepted. Failure logs include elapsed and stalled milliseconds, never key material. This bounds a stalled peer without treating a slow, progressing record as an immediate disconnect.
