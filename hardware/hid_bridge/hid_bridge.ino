@@ -3,6 +3,7 @@
 #include <esp_task_wdt.h>
 #include <esp_mac.h>
 #include "hid_link.h"
+#include "src/hid/serial_line.h"
 #include "src/hid/command.h"
 #include "ble_link.h"
 #include "netcfg.h"
@@ -138,6 +139,7 @@ void startAirplay() {
 }
 
 void setup() {
+  Serial.setRxBufferSize(1024); // a whole bounded command fits even while the main loop waits for BLE
   Serial.begin(115200);
 #if DEBUG_SERIAL
   for (int i = 0; i < 30 && !Serial; i++) delay(100);  // give a serial monitor 3 s to catch the boot lines
@@ -167,10 +169,16 @@ void loop() {
   if (linked && !ble_control_connected()) { video_stream(false); video_net_close(); }
   linked = ble_control_connected();
 
+  static SerialLine serial;
+  if (serial.expire(millis())) Serial.println("0 err incomplete serial command discarded");
   String line;
-  if (Serial.available()) {  // USB serial takes the same `<id> <command>` lines, for debugging from a Mac
-    line = Serial.readStringUntil('\n');
-    if (line.endsWith("\r")) line.remove(line.length() - 1);
+  bool serialReady = false;
+  while (Serial.available() && !serialReady) {
+    auto result = serial.add((char)Serial.read(), millis());
+    if (result == SerialLine::rejected) Serial.println("0 err invalid serial command discarded");
+    if (result == SerialLine::complete) { line = serial.text(); serialReady = line.length() > 0; }
+  }
+  if (serialReady) {  // USB serial takes the same complete `<id> <command>` lines as BLE
 #if DEBUG_SERIAL
     if (line == "0 crypto-test" || line == "0 crypto-pressure-test") {
       if (airplay_state() == AIRPLAY_IDLE) crypto_probe(line == "0 crypto-pressure-test");
@@ -197,7 +205,8 @@ void loop() {
   String reply = id.toInt() || id == "0" ? board(rest, id, generation) : "err missing request id";
   if (reply.length()) ble_reply(id + " " + reply);
 #if DEBUG_SERIAL
-  Serial.printf("%s -> %s (%lu ms)\n", rest.startsWith("vnet ") ? "vnet [redacted]" : line.c_str(),
+  Serial.printf("%s -> %s (%lu ms)\n", rest.startsWith("vnet ") ? "vnet [redacted]" :
+                rest.startsWith("type ") ? "type [redacted]" : line.c_str(),
                 reply.c_str(), millis() - started);
 #endif
 }

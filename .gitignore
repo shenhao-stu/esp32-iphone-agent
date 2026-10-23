@@ -22,6 +22,8 @@ hardware/hid_bridge/build/
 hardware/tests/test
 hardware/tests/test.dSYM/
 hardware/tests/test_hid_state
+hardware/tests/test_hid_input
+hardware/tests/test_hid_input.dSYM/
 hardware/tests/test_hid_state.dSYM/
 hardware/tests/test_video_write
 hardware/tests/test_video_write.dSYM/

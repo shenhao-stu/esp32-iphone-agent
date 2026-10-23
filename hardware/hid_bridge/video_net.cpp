@@ -26,7 +26,7 @@ static mbedtls_ssl_config config;
 static mbedtls_ssl_context tls;
 static bool initialized, armed;
 static std::atomic<bool> ready;
-static uint32_t deadline, windowAt, windowBytes;
+static uint32_t deadline, windowAt, windowBytes, connectedAt;
 static std::atomic<uint32_t> rate, rateAt;
 static uint32_t socketProgress, longestStall;
 static std::atomic<TaskHandle_t> tlsOwner;
@@ -44,7 +44,12 @@ void video_net_begin() {
   mbedtls_platform_set_calloc_free(allocateTLS, esp_mbedtls_mem_free);
 }
 
-static void closePeer() {
+static void closePeer(const char *reason, int result = 0, int socketError = 0) {
+  if (peer >= 0 || initialized)
+    Serial.printf("video Wi-Fi: close reason=%s ready=%u tls=%d errno=%d age=%u revision=%u applied=%u\n",
+                  reason, ready ? 1u : 0u, result, socketError,
+                  ready ? (unsigned)(millis() - connectedAt) : 0u,
+                  (unsigned)revision.load(), (unsigned)applied.load());
   ready = false;
   if (peer >= 0) { shutdown(peer, SHUT_RDWR); close(peer); peer = -1; }
   if (initialized) { mbedtls_ssl_free(&tls); mbedtls_ssl_config_free(&config); initialized = false; }
@@ -99,7 +104,7 @@ void video_net_close() {
 
 static bool prepare() {
   uint8_t key[32];
-  closePeer();
+  closePeer("offer_changed");
   portENTER_CRITICAL(&offerLock);
   applied = revision.load();
   armed = offered;
@@ -131,7 +136,7 @@ static bool prepare() {
     Serial.printf("video Wi-Fi: TLS unavailable result=%d heap=%u largest=%u\n", result,
                   (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
                   (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
-    closePeer(); armed = false; return false;
+    closePeer("tls_setup", result); armed = false; return false;
   }
   if (listener < 0) {
     listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -142,8 +147,9 @@ static bool prepare() {
     int yes = 1;
     setsockopt(listener, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof yes);
     if (listener < 0 || bind(listener, (sockaddr *)&address, sizeof address) || listen(listener, 1)) {
+      const int socketError = errno;
       if (listener >= 0) close(listener);
-      listener = -1; closePeer(); armed = false; return false;
+      listener = -1; closePeer("listen_failed", 0, socketError); armed = false; return false;
     }
     fcntl(listener, F_SETFL, O_NONBLOCK);
   }
@@ -155,8 +161,9 @@ void video_net_poll() {
   tlsOwner = xTaskGetCurrentTaskHandle();
   if (applied != revision.load()) prepare();
   if (!armed) return;
-  if (!net_up() || (!ready && (int32_t)(millis() - deadline) >= 0)) {
-    closePeer(); armed = false; return;
+  const bool networkUp = net_up();
+  if (!networkUp || (!ready && (int32_t)(millis() - deadline) >= 0)) {
+    closePeer(networkUp ? "connect_timeout" : "net_down"); armed = false; return;
   }
   if (peer < 0) {
     peer = accept(listener, nullptr, nullptr);
@@ -167,17 +174,21 @@ void video_net_poll() {
     mbedtls_ssl_set_bio(&tls, nullptr, writeSocket, readSocket, nullptr);
   }
   if (!ready) {
+    errno = 0;
     int result = mbedtls_ssl_handshake(&tls);
-    if (!result) { ready = true; windowAt = millis(); windowBytes = 0; }
+    if (!result) { ready = true; connectedAt = windowAt = millis(); windowBytes = 0; }
     else if (result != MBEDTLS_ERR_SSL_WANT_READ && result != MBEDTLS_ERR_SSL_WANT_WRITE) {
+      const int socketError = errno;
       Serial.printf("video Wi-Fi: TLS handshake failed (%d)\n", result);
-      closePeer(); armed = false;
+      closePeer("handshake_failed", result, socketError); armed = false;
     }
   } else {
     uint8_t byte;
+    errno = 0;
     int result = mbedtls_ssl_read(&tls, &byte, 1);
     if (result != MBEDTLS_ERR_SSL_WANT_READ && result != MBEDTLS_ERR_SSL_WANT_WRITE) {
-      closePeer(); armed = false; // this one-way channel accepts no application commands
+      closePeer(result == 0 ? "read_eof" : result > 0 ? "unexpected_data" : "read_error", result, errno);
+      armed = false; // this one-way channel accepts no application commands; never log the received byte
     }
   }
 }
@@ -206,10 +217,11 @@ static bool writeAll(const uint8_t *p, size_t length) {
                     (unsigned)longestStall, (unsigned)(millis() - deadline.started));
     return true;
   }
+  const int socketError = errno;
   Serial.printf("video Wi-Fi: write failed tls=%d errno=%d heap=%u remaining=%u elapsed=%u stalled=%u\n",
-                result, errno, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)length,
+                result, socketError, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)length,
                 (unsigned)(millis() - deadline.started), (unsigned)(millis() - socketProgress));
-  closePeer(); armed = false;
+  closePeer("write_failed", result, socketError); armed = false;
   return false;
 }
 

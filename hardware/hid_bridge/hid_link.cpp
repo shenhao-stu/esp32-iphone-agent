@@ -11,6 +11,8 @@
 #include "tusb.h"
 #include "src/hid/command.h"
 #include "src/hid/state.h"
+#include "src/hid/report_send.h"
+#include "nimble/nimble/host/include/host/ble_hs.h"
 
 // One report per characteristic: IDs occur in the map/reference, never in notify payloads.
 enum { MOUSE, KEYBOARD, CONSUMER, REPORTS };
@@ -104,14 +106,21 @@ static bool sendReport(int report, const uint8_t *data, size_t size, bool releas
   esp_task_wdt_reset();
   if (!useBLE) return tud_mounted() && !tud_suspended() && usb.SendReport(usbReportIDs[report], data, size, 100);
   if (!bleReady(report)) return false;
-  // Only retry refused notifications; an accepted relative move is never repeated.
-  int h = host.snapshot().owner();
-  for (int i = 0; i < 10 && host.snapshot().owner() == h && bleReady(report); i++) {
-    if (!release && interrupted()) return false;
-    if (reports[report]->notify(data, size, h)) return true;
-    delay(5);
-  }
-  return false;
+  const int h = host.snapshot().owner();
+  const uint32_t started = millis();
+  int rc = 0;
+  bool sent = hid_send_report([&] {
+    os_mbuf *buffer = ble_hs_mbuf_from_flat(data, size);
+    rc = buffer ? ble_gatts_notify_custom(h, reports[report]->getHandle(), buffer) : BLE_HS_ENOMEM;
+    if (rc == 0) return HidReportAttempt::accepted; // notify consumes the buffer on success and failure
+    return rc == BLE_HS_ENOMEM || rc == BLE_HS_EBUSY ? HidReportAttempt::congested : HidReportAttempt::failed;
+  }, [&] { return (release || !interrupted()) && host.snapshot().owner() == h && bleReady(report); },
+     [] { return millis(); }, [] { delay(5); esp_task_wdt_reset(); });
+  if (!sent)
+    Serial.printf("hid: report failed report=%d rc=%d elapsed=%lu free=%d owner=%d ready=%d stopped=%d release=%d\n",
+                  report + 1, rc, (unsigned long)(millis() - started), os_msys_num_free(),
+                  host.snapshot().owner(), bleReady(report), interrupted(), release);
+  return sent;
 }
 
 static bool mouseReport(int8_t x = 0, int8_t y = 0, int8_t wheel = 0, int8_t pan = 0, bool release = false) {
@@ -199,9 +208,15 @@ String hid_run(const String &line, uint32_t generation) {
   } else if (cmd == "type") {
     for (size_t i = 0; i < arg.length(); i++) {
       hid_ascii(arg[i], &keys[2], &keys[0]);
-      if (interrupted() || !sendReport(KEYBOARD, keys, 8)) return failure();
+      if (interrupted() || !sendReport(KEYBOARD, keys, 8)) {
+        Serial.printf("hid: type failed index=%u length=%u phase=down\n", (unsigned)i, arg.length());
+        return failure();
+      }
       delay(8);
-      if (!sendReport(KEYBOARD, empty, 8)) return failure();
+      if (!sendReport(KEYBOARD, empty, 8)) {
+        Serial.printf("hid: type failed index=%u length=%u phase=up\n", (unsigned)i, arg.length());
+        return failure();
+      }
       delay(8);
     }
   } else if (cmd == "key") {
