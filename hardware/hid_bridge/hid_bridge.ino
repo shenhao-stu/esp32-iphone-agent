@@ -89,7 +89,7 @@ String board(const String &line, const String &id, uint32_t generation) {
 }
 
 String statusJson(bool full) {
-  static const char *apStates[] = {"idle", "connected", "streaming", "failed"};
+  static const char *apStates[] = {"idle", "connected", "streaming", "failed", "paused"};
   VideoStats v = video_stats();
   char s[768];
   snprintf(s, sizeof s,

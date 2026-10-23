@@ -53,6 +53,7 @@ void ap_mirror_stop(void);
 bool ap_mirror_running(void);
 bool ap_mirror_failed(void);
 bool ap_mirror_streaming(void);
+bool ap_mirror_paused(void);
 
 // ---- mdns.c ----
 bool ap_mdns_start(void);

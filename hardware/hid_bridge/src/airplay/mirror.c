@@ -19,6 +19,7 @@
 #include "esp_timer.h"
 #include "mbedtls/aes.h"
 #include "ctr.h"
+#include "source_state.h"
 #include "../video/gop.h"
 #include "ap_internal.h"
 
@@ -26,8 +27,8 @@
 #define NTP_INTERVAL_MS 3000
 
 static struct {
-  volatile bool run, done, failed, have_video;
-  volatile int64_t last_data_us;
+  volatile bool run, done, failed;
+  ap_source_state source;
   mbedtls_aes_context aes;
   uint8_t iv[16], stream[16];
   size_t off;
@@ -35,6 +36,14 @@ static struct {
   uint16_t timing_rport;
   int lfd, sfd, tfd, afd[2];
 } m = {.lfd = -1, .sfd = -1, .tfd = -1, .afd = {-1, -1}};
+static portMUX_TYPE source_mux = portMUX_INITIALIZER_UNLOCKED;
+
+static ap_source_state source_snapshot(void) {
+  portENTER_CRITICAL(&source_mux);
+  ap_source_state source = m.source;
+  portEXIT_CRITICAL(&source_mux);
+  return source;
+}
 
 static int64_t now_ms(void) { return esp_timer_get_time() / 1000; }
 static uint32_t le32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
@@ -74,7 +83,10 @@ static void handle_codec(const uint8_t *p, size_t n) {
 }
 
 static void handle_packet(const uint8_t *hdr, uint8_t *p, size_t n) {
-  m.last_data_us = esp_timer_get_time();
+  portENTER_CRITICAL(&source_mux);
+  m.source = ap_source_packet(m.source, hdr[4], hdr[6] | (uint16_t)hdr[7] << 8,
+                              esp_timer_get_time());
+  portEXIT_CRITICAL(&source_mux);
   if (m.failed) return;  // a broken CTR/reference chain cannot recover on a heartbeat
   if (hdr[4] == 0x01) { handle_codec(p, n); return; }
   if (hdr[4] != 0x00 || !n) return;  // 0x02/0x05: heartbeat and streaming reports
@@ -87,8 +99,18 @@ static void handle_packet(const uint8_t *hdr, uint8_t *p, size_t n) {
            (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     return;
   }
-  m.have_video = true;
+  portENTER_CRITICAL(&source_mux);
+  m.source = ap_source_frame(m.source, esp_timer_get_time());
+  portEXIT_CRITICAL(&source_mux);
   if (ap_cfg.on_au) ap_cfg.on_au(p, n, annexb_has_idr(p, n));
+}
+
+static void log_source(void) {
+  ap_source_state s = source_snapshot();
+  ap_log("mirror: source paused=%u codec=%04x frames=%" PRIu32 " age_ms=%" PRId64
+         " packets=%" PRIu32 " reports=%" PRIu32 " changes=%" PRIu32,
+         s.suspended, s.codec_option, s.frames, ap_source_frame_age_ms(s, esp_timer_get_time()),
+         s.packets, s.reports, s.transitions);
 }
 
 static void send_ntp(uint8_t req[32]) {
@@ -108,7 +130,12 @@ static void mirror_task(void *arg) {
   size_t got = 0, need = 128, cap = 0;
   bool in_payload = false;
   int64_t next_ntp = 0;
+  int64_t next_source_log = 0;
   while (m.run) {
+    if (now_ms() >= next_source_log) {
+      log_source();  // Bounded metadata only, including while the source stops sending video.
+      next_source_log = now_ms() + 5000;
+    }
     if (m.timing_rport && now_ms() >= next_ntp) {
       send_ntp(ntp);
       next_ntp = now_ms() + NTP_INTERVAL_MS;
@@ -185,10 +212,12 @@ bool ap_mirror_start(const uint8_t aeskey[16], uint64_t stream_id, uint32_t remo
   mbedtls_aes_init(&m.aes);
   mbedtls_aes_setkey_enc(&m.aes, key, 128);
   m.off = 0;
-  m.failed = m.have_video = false;
+  m.failed = false;
+  portENTER_CRITICAL(&source_mux);
+  m.source = (ap_source_state){0};
+  portEXIT_CRITICAL(&source_mux);
   m.remote_ip = remote_ip;
   m.timing_rport = timing_rport;
-  m.last_data_us = 0;
   m.lfd = bind_sock(SOCK_STREAM, AP_MIRROR_PORT);
   m.tfd = bind_sock(SOCK_DGRAM, AP_TIMING_PORT);
   m.afd[0] = bind_sock(SOCK_DGRAM, AP_AUDIO_DATA_PORT);
@@ -218,6 +247,7 @@ bool ap_mirror_running(void) { return m.run; }
 bool ap_mirror_failed(void) { return m.run && m.failed; }
 
 bool ap_mirror_streaming(void) {
-  return m.run && !m.failed && m.have_video && m.last_data_us
-      && esp_timer_get_time() - m.last_data_us < 3000000;
+  return m.run && !m.failed && ap_source_streaming(source_snapshot(), esp_timer_get_time());
 }
+
+bool ap_mirror_paused(void) { return m.run && !m.failed && source_snapshot().suspended; }

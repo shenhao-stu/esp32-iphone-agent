@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-enum { AIRPLAY_IDLE, AIRPLAY_CONNECTED, AIRPLAY_STREAMING, AIRPLAY_FAILED };
+enum { AIRPLAY_IDLE, AIRPLAY_CONNECTED, AIRPLAY_STREAMING, AIRPLAY_FAILED, AIRPLAY_PAUSED };
 
 typedef struct {
   const char *name;         // receiver name shown in Screen Mirroring
@@ -31,7 +31,7 @@ typedef struct {
 
 // Advertises over mDNS and starts the RTSP server task. Call once Wi-Fi is up (any mode).
 bool airplay_start(const airplay_cfg *cfg);
-int airplay_state(void);  // AIRPLAY_IDLE / _CONNECTED / _STREAMING / _FAILED
+int airplay_state(void);  // AIRPLAY_IDLE / _CONNECTED / _STREAMING / _FAILED / _PAUSED (source flagged pause)
 // Display advertised in /info from the next mirroring session on.
 void airplay_set_display(uint16_t width, uint16_t height, uint8_t max_fps);
 

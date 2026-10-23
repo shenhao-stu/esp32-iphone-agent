@@ -29,4 +29,6 @@ hardware/tests/test_video_write
 hardware/tests/test_video_write.dSYM/
 hardware/tests/test_video_stream
 hardware/tests/test_video_stream.dSYM/
+hardware/tests/test_airplay_source
+hardware/tests/test_airplay_source.dSYM/
 hardware/tools/out/
