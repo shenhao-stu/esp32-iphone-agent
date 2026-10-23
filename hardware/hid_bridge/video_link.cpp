@@ -4,6 +4,7 @@
 #include "ble_link.h"
 #include "video_net.h"
 #include "src/video/gop.h"
+#include "src/video/stream_control.h"
 
 // GOP since the latest IDR; overflow drops it until the next IDR. A still screen gets an IDR only every
 // few minutes, so room for ~27 min of AUs at 5 fps (P-frames of a still screen are tiny).
@@ -25,10 +26,10 @@ static SemaphoreHandle_t lock;
 static uint8_t *scratch;
 static QueueHandle_t reqs;
 static TaskHandle_t task;
-static volatile bool streaming;
+static VideoStreamControl stream;
 // Stream position as units since the GOP's IDR (gop.base + index), so the mirror task can drop units the app
-// already has (video_on_au) while this task sends.
-static volatile uint32_t txGen = UINT32_MAX, txNext;
+// already has (video_on_au) while this task sends. Only the video task writes these cursors.
+static std::atomic<uint32_t> txEpoch{0}, txGen{UINT32_MAX}, txNext{0};
 static uint16_t seq;
 static uint8_t *chunk;
 static uint32_t winStart, winBytes, winFrames, lastIdr;
@@ -44,7 +45,7 @@ static bool sendAu(const uint8_t *p, size_t n, uint8_t flags, uint32_t ts, int t
   vchunk c;
   vchunk_begin(&c, p, n, flags, ts);
   for (size_t len; (len = vchunk_next(&c, chunk, room, seq)) > 0;) {
-    if (continuous && !streaming) return false;
+    if (continuous && !stream.isCurrent(txEpoch.load())) return false;
     bool ok = false;
     for (int t = 0; t < tries && !ok; t++) ok = wifi ? video_net_send(chunk, len) : ble_video_send(chunk, len);
     seq++;
@@ -125,7 +126,12 @@ static String doBench(uint32_t kb, bool wifi) {
 // send, start over from the GOP's IDR; once its front was dropped, only the next IDR can restart it.
 static void streamStep() {
   static uint8_t cfg[GOP_CFG_MAX];
-  if (!streaming || (!video_net_ready() && !ble_video_room())) {
+  const uint32_t epoch = stream.epoch();
+  if (epoch != txEpoch.load()) {
+    txGen = UINT32_MAX; // off/on between task ticks still requires a complete replay
+    txEpoch = epoch;
+  }
+  if (!stream.isCurrent(epoch) || (!video_net_ready() && !ble_video_room())) {
     txGen = UINT32_MAX;  // resend config + whole GOP when streaming resumes
     return;
   }
@@ -138,7 +144,7 @@ static void streamStep() {
     txGen = gen;
     if (!sendAu(cfg, cfg_len, VF_CONFIG, cfg_ts, 3, true)) { txGen = UINT32_MAX; return; }
   }
-  for (gop_au au; streaming && txNext < end && copyAu(gen, txNext, &au); txNext = txNext + 1)
+  for (gop_au au; stream.isCurrent(epoch) && txNext < end && copyAu(gen, txNext, &au); txNext = txNext + 1)
     if (!sendAu(scratch, au.len, au.idr ? VF_IDR : 0, au.ts, 3, true)) { txGen = UINT32_MAX; return; }
 }
 
@@ -194,14 +200,17 @@ void video_on_au(const uint8_t *au, size_t len, bool idr) {
   xSemaphoreTake(lock, portMAX_DELAY);
   // iOS sends an IDR only when mirroring starts, so the GOP outgrows the buffer within minutes. While the app
   // streams it already holds every unit sent: drop those rather than the whole GOP, and the stream stays live.
-  if (!idr && !gop.wait_idr && !gop_fits(&gop, len) && streaming && txGen == gop.gen)
+  if (!idr && !gop.wait_idr && !gop_fits(&gop, len) && stream.isCurrent(txEpoch.load()) && txGen == gop.gen)
     gop_drop_front(&gop, (int)(txNext - gop.base));
   gop_push(&gop, au, len, idr, now);
   xSemaphoreGive(lock);
   xTaskNotifyGive(task);
 }
 
-void video_stream(bool on) { streaming = on; }
+void video_stream(bool on) {
+  stream.set(on);
+  if (task) xTaskNotifyGive(task);
+}
 
 static void request(const String &id, bool bench, uint32_t kb, bool wifi = false) {
   Req r = {{0}, kb, bench, wifi};
@@ -217,7 +226,7 @@ VideoStats video_stats() {
   xSemaphoreTake(lock, portMAX_DELAY);
   uint32_t gopBytes = gop.used, overflows = gop.overflows, trims = gop.trims;
   bool anchored = !gop.wait_idr && gop.base == 0 && gop.n > 0;
-  int32_t lag = streaming && txGen == gop.gen ? (int32_t)gop_pending(&gop, txNext) : -1;
+  int32_t lag = stream.isCurrent(txEpoch.load()) && txGen == gop.gen ? (int32_t)gop_pending(&gop, txNext) : -1;
   xSemaphoreGive(lock);
   return {fresh ? statKbps : 0, statIdrMs, gopBytes, fresh ? statFps : 0, overflows, trims, anchored, lag};
 }

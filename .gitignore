@@ -25,4 +25,6 @@ hardware/tests/test_hid_state
 hardware/tests/test_hid_state.dSYM/
 hardware/tests/test_video_write
 hardware/tests/test_video_write.dSYM/
+hardware/tests/test_video_stream
+hardware/tests/test_video_stream.dSYM/
 hardware/tools/out/
