@@ -11,11 +11,12 @@ int main() {
   assert(slow.expired(10100)); // bound total time even with a trickling peer
   VideoWriteDeadline stalled(50);
   stalled.progress(800);
-  assert(!stalled.expired(2799));
-  assert(stalled.expired(2800)); // stop a peer which made no progress for 2 s
+  assert(!stalled.expired(3800)); // retain the reference stream across a short TCP retransmission stall
+  assert(!stalled.expired(5799));
+  assert(stalled.expired(5800)); // stop a peer which made no progress for 5 s
   VideoWriteDeadline wrap(UINT32_MAX - 1000);
   wrap.progress(100);
-  assert(!wrap.expired(2099));
-  assert(wrap.expired(2100)); // millis() rollover does not extend the deadline
+  assert(!wrap.expired(5099));
+  assert(wrap.expired(5100)); // millis() rollover does not extend the deadline
   std::puts("Video write deadline tests passed");
 }

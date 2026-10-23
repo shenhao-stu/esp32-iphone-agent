@@ -2,6 +2,9 @@
 #pragma once
 #include <Arduino.h>
 
+// Install once during setup, before Wi-Fi/AirPlay tasks start. Only video-task record buffers use PSRAM.
+void video_net_begin();
+
 String video_net_offer(const String &key); // 32-byte hex key, or "off"; never returns or logs the key
 void video_net_close();
 void video_net_poll();                    // video task owns all sockets and TLS state

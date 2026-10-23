@@ -1,3 +1,6 @@
+extern "C" {
+#include <esp_mem.h>
+}
 #include "video_net.h"
 #include "netcfg.h"
 #include "src/video/write_deadline.h"
@@ -7,6 +10,7 @@
 #include <fcntl.h>
 #include <lwip/sockets.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/platform.h>
 #include <mbedtls/platform_util.h>
 
 static constexpr uint16_t PORT = 7002;
@@ -24,7 +28,21 @@ static bool initialized, armed;
 static std::atomic<bool> ready;
 static uint32_t deadline, windowAt, windowBytes;
 static std::atomic<uint32_t> rate, rateAt;
-static uint32_t socketProgress;
+static uint32_t socketProgress, longestStall;
+static std::atomic<TaskHandle_t> tlsOwner;
+
+static void *allocateTLS(size_t count, size_t size) {
+  if (size && count > SIZE_MAX / size) return nullptr;
+  if (xTaskGetCurrentTaskHandle() == tlsOwner.load() && count * size >= 16 * 1024)
+    return heap_caps_calloc(count, size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+  return esp_mbedtls_mem_calloc(count, size);
+}
+
+void video_net_begin() {
+  // The SDK allocator hook is global, but routing is limited to the sole TLS owner and large buffers.
+  // Both heaps use heap_caps_free; small TLS objects and all other tasks keep the SDK's allocation policy.
+  mbedtls_platform_set_calloc_free(allocateTLS, esp_mbedtls_mem_free);
+}
 
 static void closePeer() {
   ready = false;
@@ -37,7 +55,11 @@ static int writeSocket(void *, const unsigned char *p, size_t n) {
   // lwIP's nonblocking send can reject a whole TLS record larger than TCP_SND_BUF.
   // Partial writes let TLS advance using the available TCP window.
   int result = send(peer, p, min(n, (size_t)1460), 0);
-  if (result > 0) socketProgress = millis();
+  if (result > 0) {
+    uint32_t now = millis();
+    longestStall = max(longestStall, now - socketProgress);
+    socketProgress = now;
+  }
   return result >= 0 ? result : errno == EAGAIN || errno == EWOULDBLOCK
       ? MBEDTLS_ERR_SSL_WANT_WRITE : MBEDTLS_ERR_SSL_INTERNAL_ERROR;
 }
@@ -98,13 +120,17 @@ static bool prepare() {
   mbedtls_ssl_conf_authmode(&config, MBEDTLS_SSL_VERIFY_NONE); // PSK authenticates both peers; no certificates
   mbedtls_ssl_conf_renegotiation(&config, MBEDTLS_SSL_RENEGOTIATION_DISABLED);
   mbedtls_ssl_conf_session_tickets(&config, MBEDTLS_SSL_SESSION_TICKETS_DISABLED);
+  // Bound hardware AES staging allocations when the TLS record buffer resides in PSRAM.
+  if (!result) result = mbedtls_ssl_conf_max_frag_len(&config, MBEDTLS_SSL_MAX_FRAG_LEN_1024);
   if (!result) result = mbedtls_ssl_conf_psk(&config, key, sizeof key,
                                           (const unsigned char *)IDENTITY, sizeof IDENTITY - 1);
   mbedtls_platform_zeroize(key, sizeof key);
   if (!result) result = mbedtls_ssl_setup(&tls, &config);
-  // The stock SDK uses two 16 KiB TLS buffers. Leave space for Wi-Fi/BLE control allocations.
+  // Keep headroom for Wi-Fi/BLE control even though the two large TLS buffers now live in PSRAM.
   if (result || heap_caps_get_free_size(MALLOC_CAP_INTERNAL) < 12 * 1024) {
-    Serial.printf("video Wi-Fi: TLS unavailable (%d or low heap)\n", result);
+    Serial.printf("video Wi-Fi: TLS unavailable result=%d heap=%u largest=%u\n", result,
+                  (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                  (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL));
     closePeer(); armed = false; return false;
   }
   if (listener < 0) {
@@ -126,6 +152,7 @@ static bool prepare() {
 }
 
 void video_net_poll() {
+  tlsOwner = xTaskGetCurrentTaskHandle();
   if (applied != revision.load()) prepare();
   if (!armed) return;
   if (!net_up() || (!ready && (int32_t)(millis() - deadline) >= 0)) {
@@ -160,6 +187,7 @@ bool video_net_ready() { return ready && applied == revision.load(); }
 static bool writeAll(const uint8_t *p, size_t length) {
   VideoWriteDeadline deadline(millis());
   socketProgress = deadline.started;
+  longestStall = 0;
   int result = 0;
   while (length && video_net_ready()) {
     int n = mbedtls_ssl_write(&tls, p, length);
@@ -172,7 +200,12 @@ static bool writeAll(const uint8_t *p, size_t length) {
         deadline.expired(millis())) break;
     vTaskDelay(pdMS_TO_TICKS(1));
   }
-  if (!length) return true;
+  if (!length) {
+    if (longestStall >= 2000)
+      Serial.printf("video Wi-Fi: write resumed stalled=%u elapsed=%u\n",
+                    (unsigned)longestStall, (unsigned)(millis() - deadline.started));
+    return true;
+  }
   Serial.printf("video Wi-Fi: write failed tls=%d errno=%d heap=%u remaining=%u elapsed=%u stalled=%u\n",
                 result, errno, (unsigned)heap_caps_get_free_size(MALLOC_CAP_INTERNAL), (unsigned)length,
                 (unsigned)(millis() - deadline.started), (unsigned)(millis() - socketProgress));
