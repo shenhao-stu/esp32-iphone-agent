@@ -88,7 +88,9 @@ board timestamp (ms) for latency stats, followed by the Annex-B data.
 `seq` increments per notify; the app counts gaps as drops and waits for the next IDR/CONFIG after a gap.
 
 ## net (JSON)
-Read: `{"mode":"ap","ssid":"ESP32Agent-1A2B","pass":"<random 12 chars>","ip":"192.168.4.1"}`
+Read: `{"mode":"ap","ssid":"GAgent-1A2B","pass":"<random 12 chars>","ip":"192.168.4.1"}`
+
+This fork migrates the matching factory `ESP32Agent-<board suffix>` name to `GAgent-<board suffix>` on boot. It preserves custom SSIDs, the hotspot password, station credentials and Bluetooth bonds. Bluetooth and AirPlay names are unchanged.
 (SoftAP credentials are generated once at first boot and kept in NVS).
 Write `{"mode":"ap"}` or `{"mode":"sta","ssid":"...","pass":"..."}` — stored in NVS, board restarts Wi-Fi.
 

@@ -16,7 +16,7 @@ Watch the log (AirPlay handshake steps, boot heap/PSRAM line):
 ```bash
 arduino-cli monitor -p /dev/cu.usbmodem* -c baudrate=115200
 ```
-Without `--sta` the board opens its own hotspot `ESP32Agent-XXXX` (password: `net` read below);
+Without `--sta` the board opens its own hotspot `GAgent-XXXX` (password: `net` read below);
 the Mac can join that instead, but then it has no internet.
 
 ## 2. BLE only (no mirroring yet)

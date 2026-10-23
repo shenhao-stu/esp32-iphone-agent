@@ -117,10 +117,14 @@ void net_begin() {
   prefs.begin("agent", false);
   apSsid = prefs.getString("ap_ssid", "");
   apPass = prefs.getString("ap_pass", "");
-  if (apSsid.isEmpty() || apPass.length() < 8) {
-    apSsid = "ESP32Agent-" + board_suffix();
-    apPass = randomPass();
+  const String suffix = board_suffix();
+  // Migrate only our generated default; retain custom names, credentials and BLE bonds.
+  if (apSsid.isEmpty() || apSsid == "ESP32Agent-" + suffix) {
+    apSsid = "GAgent-" + suffix;
     prefs.putString("ap_ssid", apSsid);
+  }
+  if (apPass.length() < 8) {
+    apPass = randomPass();
     prefs.putString("ap_pass", apPass);
   }
   mode = prefs.getString("mode", "ap");
