@@ -81,7 +81,11 @@ static void startWifi() {
   if (mode == "off") {  // diagnostics: BLE alone on the radio
     WiFi.mode(WIFI_OFF);
   } else if (mode == "sta") {
-    WiFi.mode(WIFI_STA);  // keep modem sleep on: required while BLE shares the radio
+    WiFi.mode(WIFI_STA);
+    // Modem sleep holds inbound frames until a beacon, which delays the iPhone's AirPlay ACKs: measured probe
+    // delays p95 3.3 s and sessions throttled to ~4 frames/min; with sleep off a 21-minute run kept 87–183/min.
+    // BLE HID stayed connected throughout. STA boards have their own supply ("wifips min" restores sleep).
+    WiFi.setSleep(false);
     WiFi.setAutoReconnect(false);
     retryGap = 5000;
     retryAt = millis() + retryGap;

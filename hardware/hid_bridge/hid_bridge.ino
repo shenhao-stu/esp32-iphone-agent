@@ -2,6 +2,7 @@
 // Power the board separately for wireless use. USB HID remains an explicit option.
 #include <esp_task_wdt.h>
 #include <esp_mac.h>
+#include <esp_wifi.h>
 #include "hid_link.h"
 #include "src/hid/serial_line.h"
 #include "src/hid/command.h"
@@ -75,6 +76,17 @@ String board(const String &line, const String &id, uint32_t generation) {
     cfg_set_fps(a);
     airplay_set_display(cfg_width(), cfg_height(), a);
     return "ok";
+  }
+  if (cmd == "wifips") {  // A/B knob, not stored: modem sleep delays inbound TCP ACKs to beacon intervals
+    if (arg.length() && arg != "none" && arg != "min" && arg != "max") return "err usage: wifips none|min|max";
+    if (arg.length()) {
+      wifi_ps_type_t type = arg == "none" ? WIFI_PS_NONE : arg == "max" ? WIFI_PS_MAX_MODEM : WIFI_PS_MIN_MODEM;
+      esp_err_t result = esp_wifi_set_ps(type);
+      if (result != ESP_OK) return String("err ") + esp_err_to_name(result);
+    }
+    wifi_ps_type_t now;
+    esp_wifi_get_ps(&now);
+    return String("ok ") + (now == WIFI_PS_NONE ? "none" : now == WIFI_PS_MAX_MODEM ? "max" : "min");
   }
   if (cmd == "coex") {  // A/B knob, not stored: every boot starts at balance
     if (arg.length() && !net_coex(arg)) return "err usage: coex bt|balance|wifi";
